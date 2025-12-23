@@ -7,6 +7,8 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook import Workbook
+from typing import Optional
+
 
 
 ############################################
@@ -45,7 +47,7 @@ def parse_metadata(full_text: str) -> dict:
         report_date = None
 
     # Panel / Scheme name e.g. "MONTHLY HAEMATOLOGY"
-    panel_match = re.search(r"(MONTHLY\s+HAEMATOLOGY|CHEMISTRY|IMMUNOLOGY|COAGULATION)[^\n]*", full_text, re.IGNORECASE)
+    panel_match = re.search(r"(MONTHLY\s+[A-Z ]+)", full_text)
     panel_name = panel_match.group(1).strip() if panel_match else None
 
     # Lab name: first meaningful line usually near top of page 1
@@ -77,7 +79,7 @@ def parse_metadata(full_text: str) -> dict:
     }
 
 
-def extract_tdpa(full_text: str, idx: int) -> float | None:
+def extract_tdpa(full_text: str, idx: int) -> Optional[float]:
     """
     TEa / performance tolerance usually appears on the page as:
     'TDPA = 3.7%'
@@ -95,59 +97,40 @@ def extract_tdpa(full_text: str, idx: int) -> float | None:
     return None
 
 
-def parse_single_analyte(full_text: str, analyte_label: str) -> dict | None:
-    """
-    Each analyte block in RIQAS is very consistent in content, just not in layout.
-    Immediately BEFORE the analyte label we see:
+from typing import Optional, Dict
 
-        Your Result
-        SDI
-        RMSDI
-        Mean for Comparison
-        TS
-        RMTS
-
-    which in the raw text appears as six numbers right before the analyte name.
-    Immediately AFTER the analyte label we see:
-
-        %DEV
-        RM%DEV
-        <value>
-        <value>
-
-    We also pull TDPA = <x>% (TEa-style allowable total deviation) for that analyte.
-    """
+def parse_single_analyte(full_text: str, analyte_label: str) -> Optional[Dict]:
     idx = full_text.find(analyte_label)
     if idx == -1:
         return None
 
-    # region before label: grab last 6 numbers
-    pre_window = full_text[max(0, idx - 200): idx]
-    nums_pre = re.findall(r"[-+]?\d+\.\d+|\d+", pre_window)
-    # Take last 6 numbers, in order:
-    #   [Your Result, SDI, RMSDI, Mean for Comparison, TS, RMTS]
-    vals = nums_pre[-6:]
-    if len(vals) != 6:
+    # Work on a window AFTER the analyte label (that’s where the keyed fields are)
+    post = full_text[idx: idx + 2000]
+
+    # Your Result and SDI appear on the same line in your sample:
+    # "Your Result 353.000 SDI -6.11"
+    m_yr_sdi = re.search(r"Your Result\s+([-\d.]+)\s+SDI\s+([-\d.]+)", post)
+    if not m_yr_sdi:
         return None
-    yr, sdi, rmsdi, mean_comp, ts, rmts = [float(v) for v in vals]
+    yr = float(m_yr_sdi.group(1))
+    sdi = float(m_yr_sdi.group(2))
 
-    # region after label: get %DEV and RM%DEV.
-    # RIQAS text is usually like:
-    #   "%DEV
-    #    RM%DEV
-    #    -3.0
-    #    -0.6"
-    post_window = full_text[idx: idx + 300]
-    m = re.search(r"%DEV\s+RM%DEV\s+([-\d\.]+)\s+([-\d\.]+)", post_window)
-    if m:
-        dev = float(m.group(1))
-        rmdev = float(m.group(2))
-    else:
-        dev = None
-        rmdev = None
+    # Mean for Comparison and TS appear on the same line:
+    # "Mean for Comparison 521.531 TS 10"
+    m_mean_ts = re.search(r"Mean for Comparison\s+([-\d.]+)\s+TS\s+([-\d.]+)", post)
+    if not m_mean_ts:
+        return None
+    mean_comp = float(m_mean_ts.group(1))
+    ts = float(m_mean_ts.group(2))
 
-    # TEa / tolerance
-    tdpa = extract_tdpa(full_text, idx)
+    # %DEV line:
+    # "%DEV -32.3 Sample Number"  (so take the number right after %DEV)
+    m_dev = re.search(r"%DEV\s+([-\d.]+)", post)
+    dev = float(m_dev.group(1)) if m_dev else None
+
+    # TDPA:
+    m_tdpa = re.search(r"TDPA\s*=\s*([0-9.]+)%", post)
+    tdpa = float(m_tdpa.group(1)) if m_tdpa else None
 
     return {
         "AnalyteRaw": analyte_label,
@@ -156,42 +139,56 @@ def parse_single_analyte(full_text: str, analyte_label: str) -> dict | None:
         "%DEV": dev,
         "SDI": sdi,
         "Target Score": ts,
-        "TDPA_limit_percent": tdpa,  # allowable % deviation
+        "TDPA_limit_percent": tdpa,
     }
 
+def find_analyte_labels(full_text: str) -> list[str]:
+    """
+    Find analyte header labels that appear right after 'Mean for Comparison'
+    e.g. 'Amylase, U/l @ 37°C', 'Calcium, mmol/l', 'Chloride, mmol/l'
+    """
+    labels = []
+    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+
+    for i, ln in enumerate(lines[:-1]):
+        if ln.lower() == "mean for comparison":
+            cand = lines[i + 1]
+
+            # Filter out junk headers
+            if cand.lower().startswith("laboratory ref"):
+                continue
+            if cand.lower().startswith("cycle"):
+                continue
+
+            # Heuristic: analyte line usually contains a comma + unit-ish
+            # allow U/l, mmol/l, umol/l, mg/l, g/l, etc.
+            if re.search(r",\s*[A-Za-zµ/%]+\s*/\s*[A-Za-z]+", cand):
+                labels.append(cand)
+
+    # de-dup while preserving order
+    seen = set()
+    out = []
+    for x in labels:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 def extract_all_analytes(full_text: str) -> pd.DataFrame:
-    """
-    Define the analytes we care about for Haematology panel.
-    You can extend this list for Chemistry / Endocrine / etc without touching the logic.
-    """
-    analytes_in_pdf = [
-        "Haemoglobin, g/dl",
-        "Haematocrit (HCT), L/L",
-        "MCH, pg",
-        "MCHC, g/dl",
-        "MCV, fL",
-        "Mean Platelet Volume, fL",
-        "Plateletcrit, %",
-        "Platelets (Impedance Count), X 10 9/L",
-        "RBC (Impedance Count), X 10 12/L",
-        "Red Cell Dist. Width CV, %",
-        "WBC (Optical Count), X 10 9/L",
-    ]
+    labels = find_analyte_labels(full_text)
 
     rows = []
-    for label in analytes_in_pdf:
+    for label in labels:
         rec = parse_single_analyte(full_text, label)
         if rec:
             rows.append(rec)
 
     df = pd.DataFrame(rows)
+    if df.empty:
+        return df
 
-    # also calculate diff_from_mean (sign for bias calc)
     df["diff_from_mean"] = df["Your Result"] - df["Peer Mean"]
-
     return df
-
 
 ############################################
 # 2. RISK LOGIC (current + historical)
@@ -521,7 +518,7 @@ def update_cycle_history_sheet(wb: Workbook,
 # 4. MAIN ORCHESTRATION
 ############################################
 
-def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: str | None = None):
+def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Optional[str] = None):
     """
     Full pipeline:
       - Read PDF
