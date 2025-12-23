@@ -2,7 +2,7 @@ import re
 import datetime
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pdfplumber
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -14,13 +14,12 @@ from openpyxl.workbook import Workbook
 ############################################
 
 def read_pdf_text(pdf_path: Path) -> str:
-    """Return the full extracted text of the PDF as one big string."""
-    doc = fitz.open(pdf_path)
     chunks = []
-    for i in range(doc.page_count):
-        page = doc.load_page(i)
-        chunks.append(page.get_text("text"))
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for page in pdf.pages:
+            chunks.append(page.extract_text() or "")
     return "\n".join(chunks)
+
 
 
 def parse_metadata(full_text: str) -> dict:
