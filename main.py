@@ -78,6 +78,11 @@ def parse_metadata(full_text: str) -> dict:
         "instrument_name": instrument_name,
     }
 
+def get_pdf_report_date(pdf_path: Path):
+    from main import read_pdf_text, parse_metadata
+    txt = read_pdf_text(pdf_path)
+    meta = parse_metadata(txt)
+    return meta.get("report_date") or datetime.date.min
 
 def extract_tdpa(full_text: str, idx: int) -> Optional[float]:
     """
@@ -143,29 +148,28 @@ def parse_single_analyte(full_text: str, analyte_label: str) -> Optional[Dict]:
     }
 
 def find_analyte_labels(full_text: str) -> list[str]:
-    """
-    Find analyte header labels that appear right after 'Mean for Comparison'
-    e.g. 'Amylase, U/l @ 37°C', 'Calcium, mmol/l', 'Chloride, mmol/l'
-    """
+    # Grab whatever comes after "Mean for Comparison" either on SAME line or NEXT line
+    # then clean/filter.
+    raw = re.findall(r"Mean for Comparison\s*\n?([^\n]+)", full_text, flags=re.IGNORECASE)
+
     labels = []
-    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+    for cand in raw:
+        cand = cand.strip()
 
-    for i, ln in enumerate(lines[:-1]):
-        if ln.lower() == "mean for comparison":
-            cand = lines[i + 1]
+        # drop obvious junk
+        if not cand or len(cand) < 3:
+            continue
+        low = cand.lower()
+        if low.startswith("laboratory ref") or low.startswith("cycle") or low.startswith("all methods"):
+            continue
 
-            # Filter out junk headers
-            if cand.lower().startswith("laboratory ref"):
-                continue
-            if cand.lower().startswith("cycle"):
-                continue
+        # must look like an analyte with a unit-ish pattern
+        # e.g. "Calcium, mmol/l" "Amylase, U/l @ 37°C" "Protein, Total, g/l"
+        if re.search(r",\s*[^,]{1,25}/[^,]{1,25}", cand) or re.search(r",\s*[^,]+@",
+                                                                       cand):
+            labels.append(cand)
 
-            # Heuristic: analyte line usually contains a comma + unit-ish
-            # allow U/l, mmol/l, umol/l, mg/l, g/l, etc.
-            if re.search(r",\s*[A-Za-zµ/%]+\s*/\s*[A-Za-z]+", cand):
-                labels.append(cand)
-
-    # de-dup while preserving order
+    # de-dupe preserve order
     seen = set()
     out = []
     for x in labels:
@@ -173,6 +177,7 @@ def find_analyte_labels(full_text: str) -> list[str]:
             seen.add(x)
             out.append(x)
     return out
+
 
 def extract_all_analytes(full_text: str) -> pd.DataFrame:
     labels = find_analyte_labels(full_text)
@@ -320,6 +325,112 @@ def build_comment_and_action(final_risk: str,
 ############################################
 # 3. EXCEL UPDATE
 ############################################
+def norm_analyte(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+
+    # common hidden junk from PDFs/Excel
+    s = s.replace("\xa0", " ")      # non-breaking space
+    s = s.replace("Â", "")          # common PDF artefact before degree sign
+
+    # normalise degree variants
+    s = s.replace("º", "°")
+
+    # collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip().lower()
+
+    return s
+def norm_analyte(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    # unify degree symbol variants
+    s = s.replace("°c", "°c")
+    # special-case urate unit mismatch
+    s = s.replace("uric acid (urate), mg/dl", "uric acid (urate), mmol/l")
+    return s
+
+def load_internal_tea_map(file_path: Path) -> dict:
+    """
+    Reads a TEa mapping file (xlsx or csv) with columns:
+      - Analyte
+      - Internal_TEa
+    Returns dict: normalized_analyte -> float(Internal_TEa)
+    """
+    if file_path is None:
+        return {}
+
+    file_path = Path(file_path)
+    if not file_path.exists():
+        return {}
+
+    if file_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]:
+        df = pd.read_excel(file_path)
+    else:
+        df = pd.read_csv(file_path)
+
+    # Normalize column names
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if "Analyte" not in df.columns or "Internal_TEa" not in df.columns:
+        raise ValueError("Internal TEa file must contain columns: 'Analyte' and 'Internal_TEa'.")
+
+    df = df[["Analyte", "Internal_TEa"]].copy()
+    df["Analyte"] = df["Analyte"].astype(str).str.strip()
+    df["Internal_TEa"] = pd.to_numeric(df["Internal_TEa"], errors="coerce")
+
+    tea_map = {}
+    for _, r in df.dropna(subset=["Analyte", "Internal_TEa"]).iterrows():
+        key = norm_analyte(r["Analyte"])
+        tea_map[key] = float(r["Internal_TEa"])
+    return tea_map
+
+
+def update_latest_cycle_sheet(wb: Workbook):
+    """
+    Create/refresh a sheet called 'Latest_Cycle' which shows ONLY
+    the most recent cycle (max Report_Date) from Cycle_History.
+    """
+    if "Cycle_History" not in wb.sheetnames:
+        return
+
+    hist_ws = wb["Cycle_History"]
+    hist_df = ws_to_dataframe(hist_ws)
+
+    if hist_df.empty:
+        return
+
+    # Ensure dates are proper datetime
+    hist_df["Report_Date"] = pd.to_datetime(hist_df["Report_Date"], errors="coerce")
+    hist_df = hist_df.dropna(subset=["Report_Date"])
+
+    if hist_df.empty:
+        return
+
+    latest_date = hist_df["Report_Date"].max()
+    latest_df = hist_df[hist_df["Report_Date"] == latest_date].copy()
+
+    # (Optional) sort nicely for reviewer
+    latest_df = latest_df.sort_values(["Risk_Category_Final", "Analyte"], ascending=[False, True])
+
+    # Create or clear sheet
+    if "Latest_Cycle" in wb.sheetnames:
+        ws = wb["Latest_Cycle"]
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet("Latest_Cycle")
+
+    # Write header
+    headers = list(latest_df.columns)
+    for col_i, h in enumerate(headers, start=1):
+        ws.cell(row=1, column=col_i).value = h
+
+    # Write rows
+    for r_i, row in enumerate(latest_df.itertuples(index=False), start=2):
+        for c_i, val in enumerate(row, start=1):
+            ws.cell(row=r_i, column=c_i).value = val
 
 def ensure_cycle_history_sheet(wb: Workbook):
     """Create Cycle_History sheet with headers if it doesn't exist yet."""
@@ -336,16 +447,53 @@ def ensure_cycle_history_sheet(wb: Workbook):
             "SDI",
             "Target_Score",
             "TEa_or_TDPA(%)",
+            "Internal_TEa",  # ✅ NEW
             "diff_from_mean",
             "Risk_Category_BaseOnly",
             "Risk_Category_Final",
             "Bias_Flag_Last3",
             "Trend_Flag_Last3",
+            "Within_Internal_TEa?",  # ✅ NEW
             "Required_Action",
             "Comment",
         ]
         for col_i, header in enumerate(headers, start=1):
             ws.cell(row=1, column=col_i).value = header
+
+def ensure_cycle_history_columns(wb: Workbook):
+    """
+    If Cycle_History already exists but is missing the new columns,
+    insert them at the correct positions.
+    """
+    if "Cycle_History" not in wb.sheetnames:
+        return
+
+    ws = wb["Cycle_History"]
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    headers = [str(h).strip() if h is not None else "" for h in headers]
+
+    def find_col(name: str):
+        return headers.index(name) + 1 if name in headers else None
+
+    # --- Insert Internal_TEa after TEa_or_TDPA(%) ---
+    if "Internal_TEa" not in headers:
+        tea_col = find_col("TEa_or_TDPA(%)")
+        if tea_col is None:
+            raise ValueError("Cycle_History missing 'TEa_or_TDPA(%)'")
+        ws.insert_cols(tea_col + 1)
+        ws.cell(row=1, column=tea_col + 1).value = "Internal_TEa"
+
+        # refresh headers
+        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+        headers = [str(h).strip() if h is not None else "" for h in headers]
+
+    # --- Insert Within_Internal_TEa? after Trend_Flag_Last3 ---
+    if "Within_Internal_TEa?" not in headers:
+        trend_col = find_col("Trend_Flag_Last3")
+        if trend_col is None:
+            raise ValueError("Cycle_History missing 'Trend_Flag_Last3'")
+        ws.insert_cols(trend_col + 1)
+        ws.cell(row=1, column=trend_col + 1).value = "Within_Internal_TEa?"
 
 
 def ws_to_dataframe(ws) -> pd.DataFrame:
@@ -357,6 +505,68 @@ def ws_to_dataframe(ws) -> pd.DataFrame:
     # Drop completely empty rows
     df = df.dropna(how="all")
     return df
+
+def backfill_internal_tea_in_cycle_history(wb: Workbook, internal_tea_map: dict):
+    """
+    For existing Cycle_History rows, fill Internal_TEa and Within_Internal_TEa?
+    where they are blank, using the current internal_tea_map.
+    """
+    if "Cycle_History" not in wb.sheetnames:
+        return
+
+    ws = wb["Cycle_History"]
+
+    # Read sheet into DF
+    hist_df = ws_to_dataframe(ws)
+    if hist_df.empty:
+        return
+
+    # Make sure required columns exist in DF (in case header row exists but DF is older)
+    if "Analyte" not in hist_df.columns or "%DEV" not in hist_df.columns:
+        return
+    if "Internal_TEa" not in hist_df.columns:
+        hist_df["Internal_TEa"] = None
+    if "Within_Internal_TEa?" not in hist_df.columns:
+        hist_df["Within_Internal_TEa?"] = None
+
+    # Normalize analyte + map TEa
+    hist_df["_tea_key"] = hist_df["Analyte"].apply(norm_analyte)
+    mapped = hist_df["_tea_key"].map(internal_tea_map)
+
+    # Only fill Internal_TEa if blank
+    internal_blank = hist_df["Internal_TEa"].isna() | (hist_df["Internal_TEa"].astype(str).str.strip() == "")
+    hist_df.loc[internal_blank, "Internal_TEa"] = mapped[internal_blank]
+
+    # Recompute Within_Internal_TEa? where blank AND TEa exists
+    def within_internal_hist(r):
+        try:
+            tea = r["Internal_TEa"]
+            dev = r["%DEV"]
+            if pd.isna(tea) or str(tea).strip() == "":
+                return ""
+            if pd.isna(dev) or str(dev).strip() == "":
+                return ""
+            return "Yes" if abs(float(dev)) <= float(tea) else "No"
+        except Exception:
+            return ""
+
+    within_blank = hist_df["Within_Internal_TEa?"].isna() | (hist_df["Within_Internal_TEa?"].astype(str).str.strip() == "")
+    hist_df.loc[within_blank, "Within_Internal_TEa?"] = hist_df.loc[within_blank].apply(within_internal_hist, axis=1)
+
+    hist_df = hist_df.drop(columns=["_tea_key"], errors="ignore")
+
+    # Rewrite the sheet (keep current header order exactly as in Excel)
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    headers = [str(h).strip() if h is not None else "" for h in headers]
+
+    # Clear everything below header
+    if ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
+
+    # Append rows in the exact header order
+    for _, r in hist_df.iterrows():
+        row_out = [r.get(h, None) for h in headers]
+        ws.append(row_out)
 
 
 def append_df_to_worksheet(ws, df: pd.DataFrame):
@@ -511,7 +721,9 @@ def update_cycle_history_sheet(wb: Workbook,
 # 4. MAIN ORCHESTRATION
 ############################################
 
-def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Optional[str] = None):
+def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Optional[str] = None,
+                                    internal_tea_map: Optional[dict] = None):
+
     """
     Full pipeline:
       - Read PDF
@@ -530,11 +742,37 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
     full_text = read_pdf_text(pdf_path)
     meta = parse_metadata(full_text)
     df = extract_all_analytes(full_text)
+    if df.empty:
+        raise ValueError("No analytes extracted from this PDF (layout/label detection failed).")
+    print("  meta:", meta)
+    print("  analytes found:", len(df))
 
     # Attach metadata columns now (cycle/date/sample etc)
     df["Cycle_No"] = meta["cycle_no"]
     df["Sample_No"] = meta["sample_no"]
     df["Report_Date"] = meta["report_date"]
+
+    # ✅ FORCE pandas Timestamp (critical for comparisons & sorting)
+    df["Report_Date"] = pd.to_datetime(df["Report_Date"], errors="coerce")
+
+    internal_tea_map = internal_tea_map or {}
+
+    df["_tea_key"] = df["AnalyteRaw"].apply(norm_analyte)
+    df["Internal_TEa"] = df["_tea_key"].map(internal_tea_map)
+
+    def within_internal(row):
+        if pd.isna(row["Internal_TEa"]) or pd.isna(row["%DEV"]):
+            return ""
+        return "Yes" if abs(float(row["%DEV"])) <= float(row["Internal_TEa"]) else "No"
+
+    df["Within_Internal_TEa?"] = df.apply(within_internal, axis=1)
+    df = df.drop(columns=["_tea_key"])
+
+    missing = df[df["Internal_TEa"].isna()]["AnalyteRaw"].tolist()
+    if missing:
+        print("⚠️ No Internal_TEa match for:", missing)
+    else:
+        print("✅ Internal_TEa matched for all analytes in this PDF.")
 
     # Rename for workbook logic
     df["Parameter_Name"] = df["AnalyteRaw"]
@@ -546,6 +784,9 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         wb = Workbook()
 
     ensure_cycle_history_sheet(wb)
+    ensure_cycle_history_columns(wb)
+    # ✅ backfill old rows that existed before these columns were added
+    backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
 
     # We'll convert Cycle_History (existing) to df_hist for historical risk calc
     hist_ws = wb["Cycle_History"]
@@ -560,14 +801,32 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         "SDI",
         "Target_Score",
         "TEa_or_TDPA(%)",
+        "Internal_TEa",  # ✅
         "diff_from_mean",
         "Risk_Category_BaseOnly",
         "Risk_Category_Final",
         "Bias_Flag_Last3",
         "Trend_Flag_Last3",
+        "Within_Internal_TEa?",  # ✅
         "Required_Action",
         "Comment",
     ])
+
+    if not hist_df_existing.empty:
+        hist_df_existing["Report_Date"] = pd.to_datetime(
+            hist_df_existing["Report_Date"], errors="coerce"
+        )
+    # --- STEP 4: build set of existing cycle/analyte keys (deduplication) ---
+    existing_keys = set()
+
+    if not hist_df_existing.empty:
+        for _, r in hist_df_existing.iterrows():
+            c = r.get("Cycle_No")
+            s = r.get("Sample_No")
+            a = r.get("Analyte")
+            if pd.isna(c) or pd.isna(s) or not a:
+                continue
+            existing_keys.add((int(c), int(s), str(a).strip()))
 
     # --- build risk per analyte, including historical escalation ---
     enriched_rows_for_history = []
@@ -576,8 +835,25 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
     for _, row in df.iterrows():
         analyte_name = row["Parameter_Name"]
 
+        key = (row["Cycle_No"], row["Sample_No"], analyte_name)
+        if key in existing_keys:
+            continue
+
         # Build a temp frame with existing + this new measurement for THIS analyte
         sub_hist = hist_df_existing[hist_df_existing["Analyte"] == analyte_name].copy()
+
+        # --- STEP 5: ensure historical base risk is populated ---
+        if not sub_hist.empty:
+            for idx_hist, r in sub_hist.iterrows():
+                if pd.isna(r.get("Risk_Category_BaseOnly")):
+                    # reconstruct a pseudo-row compatible with base_risk_for_row
+                    pseudo = pd.Series({
+                        "SDI": r["SDI"],
+                        "Target Score": r["Target_Score"],
+                        "%DEV": r["%DEV"],
+                        "TDPA_limit_percent": r["TEa_or_TDPA(%)"],
+                    })
+                    sub_hist.at[idx_hist, "Risk_Category_BaseOnly"] = base_risk_for_row(pseudo)
 
         new_point = {
             "Cycle_No": row["Cycle_No"],
@@ -590,7 +866,9 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             "SDI": row["SDI"],
             "Target_Score": row["Target Score"],
             "TEa_or_TDPA(%)": row["TDPA_limit_percent"],
+            "Internal_TEa": row["Internal_TEa"],
             "diff_from_mean": row["diff_from_mean"],
+            "Within_Internal_TEa?": row["Within_Internal_TEa?"],  # ✅ ADD THIS
         }
 
         new_point_df = pd.DataFrame([new_point])
@@ -623,17 +901,15 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             base_risk_label,
         )
 
-        comment_txt, action_txt = build_comment_and_action(
-            final_risk_label,
-            bias_last3,
-            trend_last3
-        )
+        comment_txt, action_txt = build_comment_and_action(final_risk_label, bias_last3, trend_last3)
 
-        simulated_hist.loc[simulated_hist.index[-1], "Risk_Category_Final"] = final_risk_label
-        simulated_hist.loc[simulated_hist.index[-1], "Bias_Flag_Last3"] = bool(bias_last3)
-        simulated_hist.loc[simulated_hist.index[-1], "Trend_Flag_Last3"] = bool(trend_last3)
-        simulated_hist.loc[simulated_hist.index[-1], "Required_Action"] = action_txt
-        simulated_hist.loc[simulated_hist.index[-1], "Comment"] = comment_txt
+        last = simulated_hist.index[-1]
+        simulated_hist.loc[last, "Risk_Category_Final"] = final_risk_label
+        simulated_hist.loc[last, "Bias_Flag_Last3"] = bool(bias_last3)
+        simulated_hist.loc[last, "Trend_Flag_Last3"] = bool(trend_last3)
+        simulated_hist.loc[last, "Required_Action"] = action_txt
+        simulated_hist.loc[last, "Comment"] = comment_txt
+
 
         # harvest just the *new row* (the last one we added)
         new_hist_row = simulated_hist.iloc[[-1]]
@@ -648,7 +924,16 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             "TDPA_limit_percent": row["TDPA_limit_percent"],
         })
 
-    # concat all analytes new rows
+    if not enriched_rows_for_history:
+        print("  No new rows to add (likely already in Cycle_History). Still refreshing Latest_Cycle.")
+
+        # ✅ still backfill TEa columns for existing history rows
+        backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
+
+        update_latest_cycle_sheet(wb)
+        wb.save(out_path)
+        return
+
     enriched_rows_for_history_df = pd.concat(enriched_rows_for_history, ignore_index=True)
 
     # --- write Header Information sheet ---
@@ -678,16 +963,21 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
                 "SDI",
                 "Target_Score",
                 "TEa_or_TDPA(%)",
+                "Internal_TEa",  # ✅
                 "diff_from_mean",
                 "Risk_Category_BaseOnly",
                 "Risk_Category_Final",
                 "Bias_Flag_Last3",
                 "Trend_Flag_Last3",
+                "Within_Internal_TEa?",  # ✅
                 "Required_Action",
                 "Comment",
             ]
         ]
     )
+
+    # ✅ refresh the reviewer sheet
+    update_latest_cycle_sheet(wb)
 
     # --- save workbook ---
     wb.save(out_path)
@@ -723,6 +1013,21 @@ if __name__ == "__main__":
             messagebox.showinfo("Cancelled", "No Excel template selected.")
             return
 
+        # ============================================================
+        # ✅ NEW STEP: Select the Internal TEa table ONCE (for all PDFs)
+        # Put this RIGHT HERE (after template, before output folder)
+        # ============================================================
+        tea_path = filedialog.askopenfilename(
+            title="Select Internal TEa table (xlsx or csv)",
+            filetypes=[("Excel or CSV", "*.xlsx *.xls *.csv")],
+        )
+        if not tea_path:
+            messagebox.showinfo("Cancelled", "No Internal TEa file selected.")
+            return
+
+        tea_map = load_internal_tea_map(Path(tea_path))
+        # ============================================================
+
         # 3) Choose output folder
         out_dir = filedialog.askdirectory(
             title="Select output folder for generated .xlsx files"
@@ -736,17 +1041,42 @@ if __name__ == "__main__":
         template = Path(template_path)
         out_dir = Path(out_dir)
 
-        # 4) Process each selected PDF
+        # --- SORT PDFs BY REPORT DATE ---
+        from datetime import date
+
+        def get_pdf_report_date(pdf_path: Path):
+            txt = read_pdf_text(pdf_path)
+            meta = parse_metadata(txt)
+            return meta.get("report_date") or date.min
+
+        pdf_list_sorted = sorted(pdf_list, key=get_pdf_report_date)
+
+        # ============================================================
+        # ✅ GUI STEP 3 — CREATE ROLLING WORKBOOK ONCE
+        # ============================================================
+        import shutil
+
+        rolling_out = out_dir / "RIQAS_EQA_Rolling_History.xlsx"
+
+        if not rolling_out.exists():
+            shutil.copyfile(template, rolling_out)
+        # ============================================================
+
+        # 4) Process each selected PDF (IN DATE ORDER)
         errors = []
         ok_count = 0
-        for pdf in pdf_list:
-            out_path = out_dir / f"{pdf.stem}-extracted.xlsx"
+
+        for pdf in pdf_list_sorted:
+            print("Processing:", pdf)  # ✅ correct place
+
             try:
                 process_riqas_pdf_into_workbook(
                     pdf_path=str(pdf),
-                    xlsx_path=str(template),
-                    out_path=str(out_path),
+                    xlsx_path=str(rolling_out),
+                    out_path=str(rolling_out),
+                    internal_tea_map=tea_map,  # ✅ add this
                 )
+
                 ok_count += 1
             except Exception as e:
                 errors.append(f"{pdf.name}: {e!r}")
