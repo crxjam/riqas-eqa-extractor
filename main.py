@@ -221,17 +221,10 @@ def flag_trend(last3_sdi: pd.Series) -> bool:
 
 
 def base_risk_for_row(row: pd.Series) -> str:
-    """
-    Map to Low / Moderate / High based on single-cycle performance.
-    Rules given:
-      - High if outside TEa / SDI ≥ 2 / Target Score < 40
-      - Moderate if slight bias/trend developing (≤ ±1 SD) or Target Score 41–50
-      - Otherwise Low
-    """
     abs_sdi = abs(row["SDI"])
     ts = row["Target Score"]
     abs_dev = abs(row["%DEV"]) if pd.notnull(row["%DEV"]) else None
-    tea_limit = row["TDPA_limit_percent"]  # allowable deviation %
+    tea_limit = row["TDPA_limit_percent"]
 
     high_hits = []
     if abs_sdi >= 2:
@@ -244,12 +237,12 @@ def base_risk_for_row(row: pd.Series) -> str:
     if high_hits:
         return "High"
 
-    # "Slight bias/trend developing (≤ ±1 SD)"
-    # and/or "Target score 41-50"
-    if abs_sdi <= 1 or (41 <= ts <= 50):
+    # Moderate: borderline but not failing
+    if (1 <= abs_sdi < 2) or (41 <= ts <= 50):
         return "Moderate"
 
     return "Low"
+
 
 
 def escalate_for_history(hist_df: pd.DataFrame, analyte_name: str, new_row: pd.Series,
@@ -544,7 +537,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
     df["Report_Date"] = meta["report_date"]
 
     # Rename for workbook logic
-    df["Parameter_Name"] = df["AnalyteRaw"].apply(map_parameter_name)
+    df["Parameter_Name"] = df["AnalyteRaw"]
 
     # --- open workbook / init sheets ---
     if xlsx_path.exists():
