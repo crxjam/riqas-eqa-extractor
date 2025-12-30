@@ -1,0 +1,5 @@
+pandas
+openpyxl
+pdfplumber==0.10.3
+pdfminer.six==20221105
+Pillow
