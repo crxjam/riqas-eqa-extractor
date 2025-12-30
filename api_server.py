@@ -1,57 +1,83 @@
 from fastapi import FastAPI, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-import tempfile, os, shutil
+from starlette.background import BackgroundTask
+
 from pathlib import Path
+import os
+import shutil
+import tempfile
+from datetime import date
+from typing import List
 
 # import your existing functions WITHOUT changing main.py
-from main import process_riqas_pdf_into_workbook, load_internal_tea_map, read_pdf_text, parse_metadata
-import pandas as pd
-
+from main import (
+    process_riqas_pdf_into_workbook,
+    load_internal_tea_map,
+    read_pdf_text,
+    parse_metadata,
+)
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def cleanup_dir(tmpdir: str):
+    """Delete temp working directory after response is sent."""
+    try:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception:
+        pass
+
+
 @app.post("/process")
 async def process(
-    pdfs: list[UploadFile] = File(...),
+    pdfs: List[UploadFile] = File(...),
     template: UploadFile = File(...),
     tea: UploadFile = File(...),
 ):
     """
     Accept:
-      - multiple PDFs
-      - one Excel template
-      - one Internal TEa xlsx/csv
+      - multiple PDFs (pdfs)
+      - one Excel template (template)
+      - one Internal TEa xlsx/csv (tea)
     Return:
       - one rolling workbook (RIQAS_EQA_Rolling_History.xlsx)
     """
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        pdf_dir = tmp / "pdfs"
-        pdf_dir.mkdir(parents=True, exist_ok=True)
 
+    # IMPORTANT: mkdtemp() persists until we delete it ourselves
+    tmpdir = tempfile.mkdtemp(prefix="rqxheqa_")
+    tmp = Path(tmpdir)
+    pdf_dir = tmp / "pdfs"
+    pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
         # save template
-        template_path = tmp / template.filename
-        with open(template_path, "wb") as f:
-            f.write(await template.read())
+        template_path = tmp / (template.filename or "template.xlsx")
+        template_path.write_bytes(await template.read())
 
         # save tea file
-        tea_path = tmp / tea.filename
-        with open(tea_path, "wb") as f:
-            f.write(await tea.read())
+        tea_path = tmp / (tea.filename or "tea.xlsx")
+        tea_path.write_bytes(await tea.read())
 
         # save PDFs
-        pdf_paths = []
+        pdf_paths: List[Path] = []
         for up in pdfs:
-            p = pdf_dir / up.filename
-            with open(p, "wb") as f:
-                f.write(await up.read())
+            p = pdf_dir / (up.filename or "input.pdf")
+            p.write_bytes(await up.read())
             pdf_paths.append(p)
 
         # load TEa map
         tea_map = load_internal_tea_map(tea_path)
 
-        # sort PDFs by report date (same logic as your GUI)
-        from datetime import date
+        # sort PDFs by report date
         def get_pdf_report_date(p: Path):
             txt = read_pdf_text(p)
             meta = parse_metadata(txt)
@@ -59,13 +85,14 @@ async def process(
 
         pdf_paths_sorted = sorted(pdf_paths, key=get_pdf_report_date)
 
-        # create rolling workbook once
+        # create rolling workbook from template
         rolling_out = tmp / "RIQAS_EQA_Rolling_History.xlsx"
         shutil.copyfile(template_path, rolling_out)
 
-        # process each PDF into same rolling workbook
+        # process each PDF into the rolling workbook
         errors = []
         ok = 0
+
         for pdf in pdf_paths_sorted:
             try:
                 process_riqas_pdf_into_workbook(
@@ -79,11 +106,28 @@ async def process(
                 errors.append(f"{pdf.name}: {repr(e)}")
 
         if errors:
-            return JSONResponse({"ok": ok, "total": len(pdf_paths_sorted), "errors": errors}, status_code=400)
+            # keep tempdir for debugging? (we’ll still clean it)
+            return JSONResponse(
+                {"ok": ok, "total": len(pdf_paths_sorted), "errors": errors},
+                status_code=400,
+            )
 
-        # return the file
+        # sanity check before returning
+        if not rolling_out.exists():
+            return JSONResponse(
+                {"error": "Output workbook was not created", "expected_path": str(rolling_out)},
+                status_code=500,
+            )
+
+        # Return file AND only delete tmpdir after response finishes
         return FileResponse(
             path=str(rolling_out),
             filename="RIQAS_EQA_Rolling_History.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            background=BackgroundTask(cleanup_dir, tmpdir),
         )
+
+    except Exception as e:
+        # clean up on failure too
+        cleanup_dir(tmpdir)
+        return JSONResponse({"error": repr(e)}, status_code=500)
