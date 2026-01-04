@@ -1,8 +1,8 @@
 import re
 import datetime
 from pathlib import Path
+from pdfminer.high_level import extract_text
 
-import pdfplumber
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -15,12 +15,31 @@ from typing import Optional
 # 1. PDF PARSING
 ############################################
 
-def read_pdf_text(pdf_path: Path) -> str:
-    chunks = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        for page in pdf.pages:
-            chunks.append(page.extract_text() or "")
-    return "\n".join(chunks)
+from pdfminer.layout import LAParams
+
+def read_pdf_text(pdf_path):
+    """Portable text extraction using pdfminer.six (pure Python), tuned for tables."""
+    laparams = LAParams(
+        all_texts=True,
+        detect_vertical=True,
+        line_margin=0.15,
+        word_margin=0.1,
+        char_margin=2.0,
+        boxes_flow=None,  # IMPORTANT: stops pdfminer re-ordering columns
+    )
+    text = extract_text(str(pdf_path), laparams=laparams) or ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+def normalize_pdf_text(txt: str) -> str:
+    # collapse weird whitespace inside lines, keep newlines
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in txt.splitlines()]
+    # drop empty noise lines
+    lines = [ln for ln in lines if ln]
+    return "\n".join(lines)
+
+
+
 
 
 
@@ -740,8 +759,11 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
 
     # --- parse PDF ---
     full_text = read_pdf_text(pdf_path)
+    full_text = normalize_pdf_text(full_text)
+
     meta = parse_metadata(full_text)
     df = extract_all_analytes(full_text)
+
     if df.empty:
         raise ValueError("No analytes extracted from this PDF (layout/label detection failed).")
     print("  meta:", meta)
