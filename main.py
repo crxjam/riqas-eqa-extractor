@@ -368,7 +368,9 @@ def base_risk_for_row(row: pd.Series) -> str:
     abs_sdi = abs(row["SDI"])
     ts = row["Target Score"]
     abs_dev = abs(row["%DEV"]) if pd.notnull(row["%DEV"]) else None
-    tea_limit = row["TDPA_limit_percent"]
+    tea_limit = row.get("Internal_TEa")
+    if tea_limit is None or (isinstance(tea_limit, float) and pd.isna(tea_limit)):
+        tea_limit = row.get("TDPA_limit_percent")
 
     high_hits = []
     if abs_sdi >= 2:
@@ -672,6 +674,68 @@ def ensure_cycle_history_columns(wb: Workbook):
         ws.insert_cols(trend_col + 1)
         ws.cell(row=1, column=trend_col + 1).value = "Within_Internal_TEa?"
 
+def extract_rcpa_auto_diff(full_text: str) -> pd.DataFrame:
+    """
+    Extract RCPA Automated Differential (Option 1) analytes.
+    We match each analyte block like:
+
+        Neutrophils
+        47.80
+        48.40
+        Within APS
+        -0.8
+        -0.1
+    """
+
+    analytes = [
+        "White cell count",
+        "Neutrophils",
+        "Lymphocytes",
+        "Monocytes",
+        "Eosinophils",
+        "Basophils",
+        "Immature Granulocytes",
+    ]
+
+    rows = []
+
+    for a in analytes:
+        # analyte + your + expected + review + zscore + aps
+        pat = re.compile(
+            rf"{re.escape(a)}\s+([-\d.]+)\s+([-\d.]+)\s+(Within APS|Review Required|Outside APS|Within\s+APS)\s+([-\d.]+)\s+([-\d.]+)",
+            re.IGNORECASE
+        )
+        m = pat.search(full_text)
+        if not m:
+            continue
+
+        your_result = float(m.group(1))
+        expected = float(m.group(2))
+        review = m.group(3).strip()
+        zscore = float(m.group(4))
+        aps = float(m.group(5))  # keep it, but DON'T treat as %TEa
+
+        # %DEV from expected
+        pct_dev = None
+        if expected != 0:
+            pct_dev = ((your_result - expected) / expected) * 100.0
+
+        rows.append({
+            "AnalyteRaw": a,
+            "Peer Mean": expected,          # expected = peer/target in this report
+            "Your Result": your_result,
+            "%DEV": pct_dev,
+            "SDI": zscore,                  # treat Z-score like SDI
+            "Target Score": None,           # RCPA doesn't provide TS
+            "TDPA_limit_percent": None,     # RCPA APS is NOT %TEa, so don't use it
+            "RCPA_APS": aps,
+            "RCPA_Review": review,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["diff_from_mean"] = df["Your Result"] - df["Peer Mean"]
+    return df
 
 def ws_to_dataframe(ws) -> pd.DataFrame:
     """Helper: read an openpyxl worksheet into a DataFrame (header row is row 1)."""
@@ -856,12 +920,16 @@ def update_result_summary_sheet(wb: Workbook,
         abs_sdi = abs(rec["SDI"])
         ts = rec["Target Score"]
         abs_dev = abs(rec["%DEV"]) if pd.notnull(rec["%DEV"]) else None
-        tea_lim = rec["TDPA_limit_percent"]
+        tea_lim = rec.get("Internal_TEa")
+        if tea_lim is None or (isinstance(tea_lim, float) and pd.isna(tea_lim)):
+            tea_lim = rec.get("TDPA_limit_percent")
+
         acceptable = (
-            (abs_sdi < 2) and
-            (ts > 50) and
-            (tea_lim is not None and abs_dev is not None and abs_dev <= tea_lim)
+                (abs_sdi < 2) and
+                ((ts is None) or (ts > 50)) and
+                (tea_lim is None or (abs_dev is not None and abs_dev <= tea_lim))
         )
+
         acceptable_flag = "Y" if acceptable else "N"
 
         # Pull risk-derived narrative
@@ -1057,7 +1125,11 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         return
 
     meta = parse_metadata(full_text)
-    df = extract_all_analytes(full_text)
+    # Detect RCPA Automated Differential
+    if re.search(r"Automated Differential", full_text, re.IGNORECASE) and re.search(r"RCPA", full_text, re.IGNORECASE):
+        df = extract_rcpa_auto_diff(full_text)
+    else:
+        df = extract_all_analytes(full_text)
 
     if df.empty:
         raise ValueError("No analytes extracted from this PDF (layout/label detection failed).")
