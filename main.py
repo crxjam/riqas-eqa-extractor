@@ -7,8 +7,125 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.workbook import Workbook
-from typing import Optional
 
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from datetime import datetime, date
+
+# ============================
+# RCPA PARSER (Automated DIFF)
+# ============================
+
+@dataclass
+class RCPARow:
+    program: str
+    participant_id: Optional[str]
+    survey_no: Optional[int]
+    report_date: Optional[date]
+    sample_id: str
+    analyte: str
+    your_result: float
+    expected_result: float
+    review: str
+    z_score: float
+    aps_score: float
+
+def is_rcpa_report(text: str) -> bool:
+    t = text.lower()
+    return ("rcpaqap" in t) and ("survey report" in t)
+
+def parse_rcpa_issue_date(text: str) -> Optional[date]:
+    m = re.search(r"Issue date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})", text)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%d %b %Y").date()
+    except Exception:
+        return None
+
+def parse_rcpa_participant_id(text: str) -> Optional[str]:
+    m = re.search(r"Participant ID:\s*([A-Z]{1,3}/\d+(?:\.\d+)?)", text)
+    return m.group(1).strip() if m else None
+
+def parse_rcpa_program(text: str) -> Optional[str]:
+    for line in text.splitlines()[:120]:
+        if "Automated Differential" in line:
+            return line.strip()
+    return None
+
+def parse_rcpa_survey_no(text: str) -> Optional[int]:
+    m = re.search(r"\bSurvey\s*:?[\s]*(\d+)\b", text)
+    return int(m.group(1)) if m else None
+
+def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
+    """
+    Parse the 'Summary of Performance' section.
+    """
+    program = parse_rcpa_program(text) or "RCPA Automated Differential"
+    participant_id = parse_rcpa_participant_id(text)
+    survey_no = parse_rcpa_survey_no(text)
+    report_date = parse_rcpa_issue_date(text)
+
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    # find start
+    start_idx = None
+    for i, l in enumerate(lines):
+        if re.search(r"Summary of Performance", l, re.IGNORECASE):
+            start_idx = i
+            break
+    if start_idx is None:
+        return []
+
+    sample_pat = re.compile(r"HA-[A-Z0-9]+-\d{2}-\d{2}")  # HA-AD1-25-05 etc.
+
+    # table row: Analyte  Your  Expected  Review  z  APS
+    # Review can be "Within APS" / "High" / "Low"
+    row_pat = re.compile(
+        r"^(?P<analyte>[A-Za-z \-]+?)\s+"
+        r"(?P<your>-?\d+(?:\.\d+)?)\s+"
+        r"(?P<exp>-?\d+(?:\.\d+)?)\s+"
+        r"(?P<review>Within APS|Acceptable|High|Low)\s+"
+        r"(?P<z>-?\d+(?:\.\d+)?)\s+"
+        r"(?P<aps>-?\d+(?:\.\d+)?)$"
+    )
+
+    out: List[RCPARow] = []
+    current_sample: Optional[str] = None
+
+    for l in lines[start_idx:]:
+        sm = sample_pat.search(l)
+        if sm:
+            current_sample = sm.group(0)
+            continue
+
+        # skip header lines
+        if "Analyte" in l and "Expected" in l and "z-score" in l:
+            continue
+
+        if current_sample:
+            m = row_pat.match(l)
+            if m:
+                out.append(
+                    RCPARow(
+                        program=program,
+                        participant_id=participant_id,
+                        survey_no=survey_no,
+                        report_date=report_date,
+                        sample_id=current_sample,
+                        analyte=m.group("analyte").strip(),
+                        your_result=float(m.group("your")),
+                        expected_result=float(m.group("exp")),
+                        review=m.group("review").strip(),
+                        z_score=float(m.group("z")),
+                        aps_score=float(m.group("aps")),
+                    )
+                )
+
+        # stop if we clearly leave the section
+        if current_sample and re.search(r"Cumulative Distribution Plot|Quantitative Statistics", l, re.IGNORECASE):
+            break
+
+    return out
 
 
 ############################################
@@ -166,6 +283,9 @@ def parse_single_analyte(full_text: str, analyte_label: str) -> Optional[Dict]:
         "TDPA_limit_percent": tdpa,
     }
 
+def _norm_analyte_name(s: str) -> str:
+    return " ".join(str(s).strip().lower().split())
+
 def find_analyte_labels(full_text: str) -> list[str]:
     # Grab whatever comes after "Mean for Comparison" either on SAME line or NEXT line
     # then clean/filter.
@@ -267,6 +387,35 @@ def base_risk_for_row(row: pd.Series) -> str:
 
     return "Low"
 
+def base_risk_for_rcpa(z_score: float, aps_score: float,
+                       within_internal_tea: Optional[bool],
+                       review: str) -> str:
+    """
+    RCPA equivalents:
+      - z_score ~ SDI
+      - APS score > 1 => flagged for review
+      - internal TEa (if available)
+    """
+    abs_z = abs(z_score)
+
+    high_hits = []
+    if abs_z >= 2:
+        high_hits.append("Z≥2")
+    if aps_score > 1.0:
+        high_hits.append("APS>1")
+    if within_internal_tea is False:
+        high_hits.append("Outside_Internal_TEa")
+    if review.lower() in {"high", "low"}:
+        high_hits.append("Review=High/Low")
+
+    if high_hits:
+        return "High"
+
+    # Moderate band
+    if (1 <= abs_z < 2) or (0.8 < aps_score <= 1.0):
+        return "Moderate"
+
+    return "Low"
 
 
 def escalate_for_history(hist_df: pd.DataFrame, analyte_name: str, new_row: pd.Series,
@@ -371,39 +520,48 @@ def norm_analyte(s: str) -> str:
     s = s.replace("uric acid (urate), mg/dl", "uric acid (urate), mmol/l")
     return s
 
-def load_internal_tea_map(file_path: Path) -> dict:
+def load_internal_tea_map(path: Path) -> Dict[str, Optional[float]]:
     """
-    Reads a TEa mapping file (xlsx or csv) with columns:
+    Expects columns:
       - Analyte
       - Internal_TEa
-    Returns dict: normalized_analyte -> float(Internal_TEa)
+    Values can be numeric or 'N/A'.
+    Returns dict: normalized_analyte -> TEa (float) or None
     """
-    if file_path is None:
-        return {}
+    path = Path(path)
 
-    file_path = Path(file_path)
-    if not file_path.exists():
-        return {}
-
-    if file_path.suffix.lower() in [".xlsx", ".xlsm", ".xls"]:
-        df = pd.read_excel(file_path)
+    if path.suffix.lower() in [".xlsx", ".xls"]:
+        df = pd.read_excel(path)
     else:
-        df = pd.read_csv(file_path)
+        # Handles CSV or TSV; if your file is tab-delimited this will still work
+        df = pd.read_csv(path, sep=None, engine="python")
 
-    # Normalize column names
-    df.columns = [str(c).strip() for c in df.columns]
+    # Column normalization (so minor header spelling/case doesn't break it)
+    cols = {c: c.strip() for c in df.columns}
+    df = df.rename(columns=cols)
 
     if "Analyte" not in df.columns or "Internal_TEa" not in df.columns:
-        raise ValueError("Internal TEa file must contain columns: 'Analyte' and 'Internal_TEa'.")
+        raise ValueError(f"Internal TEa file must have columns 'Analyte' and 'Internal_TEa'. Found: {list(df.columns)}")
 
-    df = df[["Analyte", "Internal_TEa"]].copy()
-    df["Analyte"] = df["Analyte"].astype(str).str.strip()
-    df["Internal_TEa"] = pd.to_numeric(df["Internal_TEa"], errors="coerce")
+    tea_map: Dict[str, Optional[float]] = {}
 
-    tea_map = {}
-    for _, r in df.dropna(subset=["Analyte", "Internal_TEa"]).iterrows():
-        key = norm_analyte(r["Analyte"])
-        tea_map[key] = float(r["Internal_TEa"])
+    for _, r in df.iterrows():
+        a = _norm_analyte_name(r["Analyte"])
+        v = r["Internal_TEa"]
+
+        if pd.isna(v):
+            tea_map[a] = None
+            continue
+
+        vs = str(v).strip()
+        if vs == "" or vs.lower() in {"n/a", "na", "none", "null"}:
+            tea_map[a] = None
+            continue
+
+        # If someone ever uses commas again, handle it safely
+        vs = vs.replace(",", ".")
+        tea_map[a] = float(vs)
+
     return tea_map
 
 
@@ -760,6 +918,143 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
     # --- parse PDF ---
     full_text = read_pdf_text(pdf_path)
     full_text = normalize_pdf_text(full_text)
+
+    # ==========================================================
+    # RCPA branch (Option B): write Cycle_History only
+    # ==========================================================
+    if is_rcpa_report(full_text):
+        internal_tea_map = internal_tea_map or {}
+
+        # Open workbook / init history
+        wb = load_workbook(xlsx_path) if xlsx_path.exists() else Workbook()
+        ensure_cycle_history_sheet(wb)
+        ensure_cycle_history_columns(wb)
+        backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
+
+        hist_ws = wb["Cycle_History"]
+        hist_df_existing = ws_to_dataframe(hist_ws) if hist_ws.max_row > 1 else pd.DataFrame()
+
+        if not hist_df_existing.empty and "Report_Date" in hist_df_existing.columns:
+            hist_df_existing["Report_Date"] = pd.to_datetime(hist_df_existing["Report_Date"], errors="coerce")
+
+        # Parse RCPA rows
+        rcpa_rows = parse_rcpa_summary_of_performance(full_text)
+        if not rcpa_rows:
+            raise ValueError("RCPA report detected, but could not parse 'Summary of Performance'.")
+
+        # Build keys for dedupe: we'll use (Report_Date, Sample_No, Analyte)
+        existing_keys = set()
+        if not hist_df_existing.empty:
+            for _, r in hist_df_existing.iterrows():
+                rd = r.get("Report_Date")
+                sn = r.get("Sample_No")
+                an = r.get("Analyte")
+                if pd.isna(rd) or pd.isna(sn) or not an:
+                    continue
+                existing_keys.add((str(pd.to_datetime(rd).date()), str(sn), str(an).strip().lower()))
+
+        enriched_rows_for_history = []
+
+        for rr in rcpa_rows:
+            analyte_name = rr.analyte.strip()
+            tea_key = _norm_analyte_name(analyte_name)
+            internal_tea = internal_tea_map.get(tea_key)  # float or None
+
+            # %DEV equivalent for RCPA (percent bias vs expected)
+            if rr.expected_result == 0:
+                dev = None
+            else:
+                dev = ((rr.your_result - rr.expected_result) / rr.expected_result) * 100.0
+
+            within_internal = None
+            if internal_tea is not None and dev is not None:
+                within_internal = (abs(dev) <= float(internal_tea))
+
+            report_dt = pd.to_datetime(rr.report_date, errors="coerce")
+
+            # Use sample_id as Sample_No column (keeps your sheet schema unchanged)
+            sample_no = rr.sample_id
+
+            dedupe_key = (str(report_dt.date()) if pd.notna(report_dt) else "", str(sample_no), analyte_name.lower())
+            if dedupe_key in existing_keys:
+                continue
+
+            new_point = {
+                "Cycle_No": rr.survey_no,           # store Survey as Cycle_No (consistent “cycle-like” index)
+                "Sample_No": sample_no,             # store RCPA sample id string
+                "Report_Date": report_dt,
+                "Analyte": analyte_name,
+                "Peer_Mean": rr.expected_result,    # expected/target acts like peer mean here
+                "Your_Result": rr.your_result,
+                "%DEV": dev,
+                "SDI": rr.z_score,                  # z-score maps to SDI conceptually
+                "Target_Score": None,               # not provided by RCPA
+                "TEa_or_TDPA(%)": rr.aps_score,      # store APS in this column (we’ll label it in comment)
+                "Internal_TEa": internal_tea,
+                "diff_from_mean": (rr.your_result - rr.expected_result),
+                "Within_Internal_TEa?": ("Yes" if within_internal is True else "No" if within_internal is False else ""),
+            }
+            new_point_df = pd.DataFrame([new_point])
+
+            # historical subset for this analyte
+            sub_hist = pd.DataFrame()
+            if not hist_df_existing.empty and "Analyte" in hist_df_existing.columns:
+                sub_hist = hist_df_existing[hist_df_existing["Analyte"].astype(str).str.lower() == analyte_name.lower()].copy()
+
+            simulated_hist = new_point_df.copy() if sub_hist.empty else pd.concat([sub_hist, new_point_df], ignore_index=True, sort=False)
+            simulated_hist = simulated_hist.sort_values(["Report_Date"]).reset_index(drop=True)
+
+            # base risk for RCPA
+            base_risk_label = base_risk_for_rcpa(
+                z_score=rr.z_score,
+                aps_score=rr.aps_score,
+                within_internal_tea=within_internal,
+                review=rr.review,
+            )
+
+            simulated_hist["Risk_Category_BaseOnly"] = simulated_hist.get("Risk_Category_BaseOnly", None)
+            simulated_hist.loc[simulated_hist.index[-1], "Risk_Category_BaseOnly"] = base_risk_label
+
+            final_risk_label, bias_last3, trend_last3 = escalate_for_history(
+                simulated_hist,
+                analyte_name,
+                pd.Series({"SDI": rr.z_score}),   # minimal new_row compat
+                base_risk_label,
+            )
+
+            comment_txt, action_txt = build_comment_and_action(final_risk_label, bias_last3, trend_last3)
+
+            last = simulated_hist.index[-1]
+            simulated_hist.loc[last, "Risk_Category_Final"] = final_risk_label
+            simulated_hist.loc[last, "Bias_Flag_Last3"] = bool(bias_last3)
+            simulated_hist.loc[last, "Trend_Flag_Last3"] = bool(trend_last3)
+            simulated_hist.loc[last, "Required_Action"] = action_txt
+            # add context: tell reviewer APS + Review label
+            simulated_hist.loc[last, "Comment"] = f"{comment_txt} (RCPA review={rr.review}, APS={rr.aps_score})"
+
+            enriched_rows_for_history.append(simulated_hist.iloc[[-1]])
+
+        # Nothing new? still refresh Latest_Cycle and save
+        if not enriched_rows_for_history:
+            update_latest_cycle_sheet(wb)
+            wb.save(out_path)
+            return
+
+        enriched_df = pd.concat(enriched_rows_for_history, ignore_index=True)
+
+        # Append to Cycle_History
+        update_cycle_history_sheet(wb, meta={}, enriched_rows=enriched_df[
+            [
+                "Cycle_No","Sample_No","Report_Date","Analyte","Peer_Mean","Your_Result",
+                "%DEV","SDI","Target_Score","TEa_or_TDPA(%)","Internal_TEa","diff_from_mean",
+                "Risk_Category_BaseOnly","Risk_Category_Final","Bias_Flag_Last3","Trend_Flag_Last3",
+                "Within_Internal_TEa?","Required_Action","Comment"
+            ]
+        ])
+
+        update_latest_cycle_sheet(wb)
+        wb.save(out_path)
+        return
 
     meta = parse_metadata(full_text)
     df = extract_all_analytes(full_text)
