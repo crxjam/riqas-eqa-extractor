@@ -22,7 +22,8 @@ export default function App() {
     setStatus("");
 
     try {
-      const res = await fetch("http://127.0.0.1:8000/process", {
+      const API = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
+      const res = await fetch(`${API}/process`, {
         method: "POST",
         body: form,
       });
