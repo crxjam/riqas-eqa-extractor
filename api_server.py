@@ -1,14 +1,14 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
 from pathlib import Path
-import os
 import shutil
 import tempfile
 from datetime import date
 from typing import List
+from io import BytesIO
 
 # import your existing functions WITHOUT changing main.py
 from main import (
@@ -38,6 +38,9 @@ app.add_middleware(
 )
 
 
+
+
+
 def cleanup_dir(tmpdir: str):
     """Delete temp working directory after response is sent."""
     try:
@@ -61,7 +64,6 @@ async def process(
       - one rolling workbook (RIQAS_EQA_Rolling_History.xlsx)
     """
 
-    # IMPORTANT: mkdtemp() persists until we delete it ourselves
     tmpdir = tempfile.mkdtemp(prefix="rqxheqa_")
     tmp = Path(tmpdir)
     pdf_dir = tmp / "pdfs"
@@ -115,28 +117,36 @@ async def process(
                 errors.append(f"{pdf.name}: {repr(e)}")
 
         if errors:
-            # keep tempdir for debugging? (we’ll still clean it)
+            cleanup_dir(tmpdir)
             return JSONResponse(
                 {"ok": ok, "total": len(pdf_paths_sorted), "errors": errors},
                 status_code=400,
             )
 
-        # sanity check before returning
         if not rolling_out.exists():
+            cleanup_dir(tmpdir)
             return JSONResponse(
                 {"error": "Output workbook was not created", "expected_path": str(rolling_out)},
                 status_code=500,
             )
 
-        # Return file AND only delete tmpdir after response finishes
-        return FileResponse(
-            path=str(rolling_out),
-            filename="RIQAS_EQA_Rolling_History.xlsx",
+        # --- STREAM THE XLSX BYTES (forces correct download handling) ---
+        data = rolling_out.read_bytes()
+        buf = BytesIO(data)
+        buf.seek(0)
+
+        headers = {
+            "Content-Disposition": 'attachment; filename="RIQAS_EQA_Rolling_History.xlsx"',
+            "Cache-Control": "no-store",
+        }
+
+        return StreamingResponse(
+            buf,
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers=headers,
             background=BackgroundTask(cleanup_dir, tmpdir),
         )
 
     except Exception as e:
-        # clean up on failure too
         cleanup_dir(tmpdir)
         return JSONResponse({"error": repr(e)}, status_code=500)
