@@ -32,7 +32,7 @@ class RCPARow:
 
 def is_rcpa_report(text: str) -> bool:
     t = text.lower()
-    return ("rcpaqap" in t) and ("survey report" in t)
+    return ("rcpa" in t) or ("rcpaqap" in t) or ("issue date:" in t and "participant id:" in t)
 
 def parse_rcpa_issue_date(text: str) -> Optional[date]:
     m = re.search(r"Issue date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})", text)
@@ -365,26 +365,31 @@ def flag_trend(last3_sdi: pd.Series) -> bool:
 
 
 def base_risk_for_row(row: pd.Series) -> str:
-    abs_sdi = abs(row["SDI"])
-    ts = row["Target Score"]
-    abs_dev = abs(row["%DEV"]) if pd.notnull(row["%DEV"]) else None
-    tea_limit = row.get("Internal_TEa")
-    if tea_limit is None or (isinstance(tea_limit, float) and pd.isna(tea_limit)):
-        tea_limit = row.get("TDPA_limit_percent")
+    abs_sdi = abs(row["SDI"]) if pd.notnull(row.get("SDI")) else None
+    ts = row.get("Target Score", None)
+    abs_dev = abs(row["%DEV"]) if pd.notnull(row.get("%DEV")) else None
+    tea_limit = row.get("TDPA_limit_percent", None)
 
     high_hits = []
-    if abs_sdi >= 2:
+
+    if abs_sdi is not None and abs_sdi >= 2:
         high_hits.append("SDI≥2")
-    if ts < 40:
-        high_hits.append("TS<40")
-    if tea_limit is not None and abs_dev is not None and abs_dev > tea_limit:
-        high_hits.append(">%TEa")
+
+    # only evaluate TS rules if TS is present
+    if ts is not None and pd.notnull(ts):
+        if ts < 40:
+            high_hits.append("TS<40")
+
+    # only evaluate TDPA if present
+    if tea_limit is not None and pd.notnull(tea_limit) and abs_dev is not None:
+        if abs_dev > float(tea_limit):
+            high_hits.append(">%TEa")
 
     if high_hits:
         return "High"
 
     # Moderate: borderline but not failing
-    if (1 <= abs_sdi < 2) or (41 <= ts <= 50):
+    if (abs_sdi is not None and 1 <= abs_sdi < 2) or (ts is not None and pd.notnull(ts) and 41 <= ts <= 50):
         return "Moderate"
 
     return "Low"
@@ -965,6 +970,83 @@ def update_cycle_history_sheet(wb: Workbook,
 ############################################
 # 4. MAIN ORCHESTRATION
 ############################################
+RCPA_HAEME_ANALYTES = [
+    "White cell count",
+    "Neutrophils",
+    "Lymphocytes",
+    "Monocytes",
+    "Eosinophils",
+    "Basophils",
+    "Immature Granulocytes",
+]
+
+def _to_float(x: str):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def parse_rcpa_automated_diff_blocks(full_text: str) -> pd.DataFrame:
+    """
+    Robust RCPA Automated Differential parser:
+    For each analyte heading, take the next numeric lines in the block:
+      - Your Result (first number)
+      - Expected Result (second number)
+      - Z-score (first "small" number after 'Within APS' if present; else next number)
+    APS / Target-score-like fields are often mangled by pdfminer; we treat them as optional.
+    """
+
+    txt = normalize_pdf_text(full_text)
+    rows = []
+
+    for analyte in RCPA_HAEME_ANALYTES:
+        m = re.search(rf"^{re.escape(analyte)}\s*$", txt, flags=re.IGNORECASE | re.MULTILINE)
+        if not m:
+            continue
+
+        block = txt[m.end(): m.end() + 800]  # window after analyte
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+
+        # collect numeric lines in the block (first ~10 is usually enough)
+        nums = []
+        for ln in lines[:20]:
+            # keep only plain numbers like 17.66, -0.6 etc
+            if re.fullmatch(r"-?\d+(\.\d+)?", ln):
+                nums.append(float(ln))
+
+        # Need at least Your + Expected
+        if len(nums) < 2:
+            continue
+
+        your = nums[0]
+        expected = nums[1]
+
+        # try to find Z-score: often the next numbers include z-score(s)
+        # Heuristic: choose the next value with abs <= 6 (typical z-score range)
+        z = None
+        for cand in nums[2:]:
+            if cand is None:
+                continue
+            if abs(cand) <= 6:
+                z = cand
+                break
+
+        # %DEV from your vs expected
+        dev = None
+        if expected not in (None, 0):
+            dev = ((your - expected) / expected) * 100.0
+
+        rows.append({
+            "AnalyteRaw": analyte,
+            "Peer Mean": expected,          # treat expected as peer/assigned for now
+            "Your Result": your,
+            "%DEV": dev,
+            "SDI": z,                       # z-score ~ SDI for your risk logic
+            "Target Score": None,           # not reliably available -> None
+            "TDPA_limit_percent": None,     # not in RCPA; we'll use Internal_TEa instead
+        })
+
+    return pd.DataFrame(rows)
 
 def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Optional[str] = None,
                                     internal_tea_map: Optional[dict] = None):
@@ -1005,10 +1087,32 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         if not hist_df_existing.empty and "Report_Date" in hist_df_existing.columns:
             hist_df_existing["Report_Date"] = pd.to_datetime(hist_df_existing["Report_Date"], errors="coerce")
 
-        # Parse RCPA rows
-        rcpa_rows = parse_rcpa_summary_of_performance(full_text)
-        if not rcpa_rows:
-            raise ValueError("RCPA report detected, but could not parse 'Summary of Performance'.")
+        # Parse RCPA using the robust block parser first (Option B)
+        df_rcpa = parse_rcpa_automated_diff_blocks(full_text)
+
+        # Fallback to Summary-of-Performance parser (nice if it works, but not required)
+        if df_rcpa is None or df_rcpa.empty:
+            rcpa_rows = parse_rcpa_summary_of_performance(full_text)
+            if rcpa_rows:
+                # convert rcpa_rows -> df_rcpa in the same schema as the rest of the app
+                tmp = []
+                for rr in rcpa_rows:
+                    dev = None if rr.expected_result == 0 else ((rr.your_result - rr.expected_result) / rr.expected_result) * 100.0
+                    tmp.append({
+                        "AnalyteRaw": rr.analyte.strip(),
+                        "Peer Mean": rr.expected_result,
+                        "Your Result": rr.your_result,
+                        "%DEV": dev,
+                        "SDI": rr.z_score,
+                        "Target Score": None,
+                        "TDPA_limit_percent": None,
+                        "diff_from_mean": rr.your_result - rr.expected_result,
+                    })
+                df_rcpa = pd.DataFrame(tmp)
+
+        if df_rcpa is None or df_rcpa.empty:
+            raise ValueError("RCPA report detected, but could not extract any analytes (blocks or summary table).")
+
 
         # Build keys for dedupe: we'll use (Report_Date, Sample_No, Analyte)
         existing_keys = set()
@@ -1023,61 +1127,76 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
 
         enriched_rows_for_history = []
 
-        for rr in rcpa_rows:
-            analyte_name = rr.analyte.strip()
+        # Try to get a report date from RCPA header (Issue date). If missing, leave blank.
+        report_dt = pd.to_datetime(parse_rcpa_issue_date(full_text), errors="coerce")
+
+        # We do NOT reliably have sample_id from the block parser.
+        # Use a constant sample_no so dedupe still works within a report.
+        sample_no = "RCPA"
+
+        # We do NOT reliably have survey_no from the block parser.
+        survey_no = parse_rcpa_survey_no(full_text)
+
+        for _, r in df_rcpa.iterrows():
+            analyte_name = str(r.get("AnalyteRaw", "")).strip()
+            if not analyte_name:
+                continue
+
+            expected = float(r["Peer Mean"]) if pd.notna(r.get("Peer Mean")) else None
+            your = float(r["Your Result"]) if pd.notna(r.get("Your Result")) else None
+            z = r.get("SDI", None)
+            dev = r.get("%DEV", None)
+
             tea_key = _norm_analyte_name(analyte_name)
             internal_tea = internal_tea_map.get(tea_key)  # float or None
 
-            # %DEV equivalent for RCPA (percent bias vs expected)
-            if rr.expected_result == 0:
-                dev = None
-            else:
-                dev = ((rr.your_result - rr.expected_result) / rr.expected_result) * 100.0
-
             within_internal = None
-            if internal_tea is not None and dev is not None:
-                within_internal = (abs(dev) <= float(internal_tea))
+            if internal_tea is not None and dev is not None and pd.notna(dev):
+                within_internal = (abs(float(dev)) <= float(internal_tea))
 
-            report_dt = pd.to_datetime(rr.report_date, errors="coerce")
-
-            # Use sample_id as Sample_No column (keeps your sheet schema unchanged)
-            sample_no = rr.sample_id
-
-            dedupe_key = (str(report_dt.date()) if pd.notna(report_dt) else "", str(sample_no), analyte_name.lower())
+            dedupe_key = (
+                str(report_dt.date()) if pd.notna(report_dt) else "",
+                str(sample_no),
+                analyte_name.lower(),
+            )
             if dedupe_key in existing_keys:
                 continue
 
             new_point = {
-                "Cycle_No": rr.survey_no,           # store Survey as Cycle_No (consistent “cycle-like” index)
-                "Sample_No": sample_no,             # store RCPA sample id string
-                "Report_Date": report_dt,
+                "Cycle_No": survey_no,  # may be None
+                "Sample_No": sample_no,  # "RCPA"
+                "Report_Date": report_dt,  # Issue date if found
                 "Analyte": analyte_name,
-                "Peer_Mean": rr.expected_result,    # expected/target acts like peer mean here
-                "Your_Result": rr.your_result,
+                "Peer_Mean": expected,
+                "Your_Result": your,
                 "%DEV": dev,
-                "SDI": rr.z_score,                  # z-score maps to SDI conceptually
-                "Target_Score": None,               # not provided by RCPA
-                "TEa_or_TDPA(%)": rr.aps_score,      # store APS in this column (we’ll label it in comment)
+                "SDI": z,
+                "Target_Score": None,
+                "TEa_or_TDPA(%)": None,  # ✅ inside dict
                 "Internal_TEa": internal_tea,
-                "diff_from_mean": (rr.your_result - rr.expected_result),
-                "Within_Internal_TEa?": ("Yes" if within_internal is True else "No" if within_internal is False else ""),
+                "diff_from_mean": (your - expected) if (your is not None and expected is not None) else None,
+                "Within_Internal_TEa?": (
+                    "Yes" if within_internal is True else "No" if within_internal is False else ""),
             }
             new_point_df = pd.DataFrame([new_point])
 
             # historical subset for this analyte
             sub_hist = pd.DataFrame()
             if not hist_df_existing.empty and "Analyte" in hist_df_existing.columns:
-                sub_hist = hist_df_existing[hist_df_existing["Analyte"].astype(str).str.lower() == analyte_name.lower()].copy()
+                sub_hist = hist_df_existing[
+                    hist_df_existing["Analyte"].astype(str).str.lower() == analyte_name.lower()
+                    ].copy()
 
-            simulated_hist = new_point_df.copy() if sub_hist.empty else pd.concat([sub_hist, new_point_df], ignore_index=True, sort=False)
+            simulated_hist = new_point_df.copy() if sub_hist.empty else pd.concat(
+                [sub_hist, new_point_df], ignore_index=True, sort=False
+            )
             simulated_hist = simulated_hist.sort_values(["Report_Date"]).reset_index(drop=True)
 
-            # base risk for RCPA
             base_risk_label = base_risk_for_rcpa(
-                z_score=rr.z_score,
-                aps_score=rr.aps_score,
+                z_score=float(z) if (z is not None and pd.notna(z)) else 0.0,
+                aps_score=0.0,  # unknown in block parser
                 within_internal_tea=within_internal,
-                review=rr.review,
+                review="",  # unknown in block parser
             )
 
             simulated_hist["Risk_Category_BaseOnly"] = simulated_hist.get("Risk_Category_BaseOnly", None)
@@ -1086,7 +1205,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             final_risk_label, bias_last3, trend_last3 = escalate_for_history(
                 simulated_hist,
                 analyte_name,
-                pd.Series({"SDI": rr.z_score}),   # minimal new_row compat
+                pd.Series({"SDI": z}),
                 base_risk_label,
             )
 
@@ -1097,8 +1216,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             simulated_hist.loc[last, "Bias_Flag_Last3"] = bool(bias_last3)
             simulated_hist.loc[last, "Trend_Flag_Last3"] = bool(trend_last3)
             simulated_hist.loc[last, "Required_Action"] = action_txt
-            # add context: tell reviewer APS + Review label
-            simulated_hist.loc[last, "Comment"] = f"{comment_txt} (RCPA review={rr.review}, APS={rr.aps_score})"
+            simulated_hist.loc[last, "Comment"] = f"{comment_txt} (RCPA block-parser; APS not available)"
 
             enriched_rows_for_history.append(simulated_hist.iloc[[-1]])
 
@@ -1125,9 +1243,16 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         return
 
     meta = parse_metadata(full_text)
-    # Detect RCPA Automated Differential
-    if re.search(r"Automated Differential", full_text, re.IGNORECASE) and re.search(r"RCPA", full_text, re.IGNORECASE):
-        df = extract_rcpa_auto_diff(full_text)
+
+    t = full_text.lower()
+    is_rcpa = ("rcpa" in t) or ("australian" in t and "quality" in t)
+    is_auto_diff = ("automated differential" in t) or ("auto differential" in t) or (
+                "neutrophils" in t and "lymphocytes" in t)
+
+    if is_rcpa and is_auto_diff:
+        df = parse_rcpa_automated_diff_blocks(full_text)
+        if df is None or df.empty:
+            df = extract_all_analytes(full_text)  # fallback
     else:
         df = extract_all_analytes(full_text)
 
