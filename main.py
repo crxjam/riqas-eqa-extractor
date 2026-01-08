@@ -63,6 +63,10 @@ def parse_rcpa_report_issue_date(text: str) -> Optional[date]:
         except Exception:
             return None
 
+def parse_rcpa_issue_date(text: str) -> Optional[date]:
+    # Backwards-compatible alias
+    return parse_rcpa_report_issue_date(text)
+
 
 def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
     """
