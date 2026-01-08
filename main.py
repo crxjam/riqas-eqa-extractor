@@ -1,5 +1,6 @@
 import re
-import datetime
+from datetime import datetime, date
+
 from pathlib import Path
 from pdfminer.high_level import extract_text
 
@@ -175,7 +176,7 @@ def parse_metadata(full_text: str) -> dict:
         cycle_no = int(m.group(1))
         sample_no = int(m.group(2))
         report_date_str = m.group(3)
-        report_date = datetime.datetime.strptime(report_date_str, "%d/%m/%Y").date()
+        report_date = datetime.strptime(report_date_str, "%d/%m/%Y").date()
     else:
         cycle_no = None
         sample_no = None
@@ -217,7 +218,7 @@ def get_pdf_report_date(pdf_path: Path):
     from main import read_pdf_text, parse_metadata
     txt = read_pdf_text(pdf_path)
     meta = parse_metadata(txt)
-    return meta.get("report_date") or datetime.date.min
+    return meta.get("report_date") or date.min
 
 def extract_tdpa(full_text: str, idx: int) -> Optional[float]:
     """
