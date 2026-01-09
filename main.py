@@ -1288,17 +1288,11 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
             ])
         )
 
-        if "Report_Date" in hist_df_existing.columns:
-            hist_df_existing["Report_Date"] = pd.to_datetime(
-                hist_df_existing["Report_Date"], errors="coerce"
-            )
         hist_df_existing = coerce_cycle_history_types(hist_df_existing)
 
         # >>> IMPORTANT <<<
         # RCPA reports do NOT update Header Information,
         # Result Summary, or Latest_Cycle
-        wb.save(out_path)
-        return
 
         # ----------------------------------------------------------
         # RCPA metadata (so Report_Date is ALWAYS populated)
