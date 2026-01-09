@@ -1068,17 +1068,29 @@ def update_result_summary_sheet(wb: Workbook,
         #   SDI < 2
         #   Target Score > 50
         #   abs(%DEV) <= TEa
-        abs_sdi = abs(rec["SDI"])
-        ts = rec["Target Score"]
-        abs_dev = abs(rec["%DEV"]) if pd.notnull(rec["%DEV"]) else None
-        tea_lim = rec.get("Internal_TEa")
-        if tea_lim is None or (isinstance(tea_lim, float) and pd.isna(tea_lim)):
-            tea_lim = rec.get("TDPA_limit_percent")
+        # acceptable? logic for column H (hardened: TS/TEa may be strings)
+        abs_sdi = abs(float(rec["SDI"])) if pd.notnull(rec.get("SDI")) and str(rec.get("SDI")).strip() != "" else None
+
+        ts_raw = rec.get("Target Score", None)
+        ts_num = pd.to_numeric(ts_raw, errors="coerce")
+        ts = None if pd.isna(ts_num) else float(ts_num)
+
+        dev_raw = rec.get("%DEV", None)
+        dev_num = pd.to_numeric(dev_raw, errors="coerce")
+        abs_dev = None if pd.isna(dev_num) else abs(float(dev_num))
+
+        # Prefer Internal_TEa; else fall back to TDPA_limit_percent
+        tea_raw = rec.get("Internal_TEa", None)
+        tea_num = pd.to_numeric(tea_raw, errors="coerce")
+        if pd.isna(tea_num):
+            tea_raw = rec.get("TDPA_limit_percent", None)
+            tea_num = pd.to_numeric(tea_raw, errors="coerce")
+        tea_lim = None if pd.isna(tea_num) else float(tea_num)
 
         acceptable = (
-                (abs_sdi < 2) and
+                (abs_sdi is not None and abs_sdi < 2) and
                 ((ts is None) or (ts > 50)) and
-                (tea_lim is None or (abs_dev is not None and abs_dev <= tea_lim))
+                ((tea_lim is None) or (abs_dev is not None and abs_dev <= tea_lim))
         )
 
         acceptable_flag = "Y" if acceptable else "N"
