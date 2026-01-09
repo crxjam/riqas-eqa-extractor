@@ -51,17 +51,25 @@ def parse_rcpa_survey_no(text: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 def parse_rcpa_report_issue_date(text: str) -> Optional[date]:
-    m = re.search(r"Report Issue Date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})", text, re.IGNORECASE)
+    m = re.search(
+        r"Report Issue Date:\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+        text,
+        re.IGNORECASE
+    )
     if not m:
         return None
-    try:
-        return datetime.strptime(m.group(1), "%d %B %Y").date()
-    except Exception:
-        # sometimes month is abbreviated
+
+    s = m.group(1).strip()
+
+    # try abbreviated month first ("08 Jan 2026")
+    for fmt in ("%d %b %Y", "%d %B %Y"):
         try:
-            return datetime.strptime(m.group(1), "%d %b %Y").date()
+            return datetime.strptime(s, fmt).date()
         except Exception:
-            return None
+            pass
+
+    return None
+
 
 def parse_rcpa_issue_date(text: str) -> Optional[date]:
     # Backwards-compatible alias used by older parts of the code
@@ -1244,7 +1252,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         enriched_rows_for_history = []
 
         # Use report date from RCPA header if available (Report Issue Date)
-        report_date = parse_rcpa_report_issue_date(text)
+        report_date = parse_rcpa_report_issue_date(full_text)
         report_dt = pd.to_datetime(report_date, errors="coerce")
 
         # Try to detect the 2 sample IDs from the report (so each sample becomes separate rows)
