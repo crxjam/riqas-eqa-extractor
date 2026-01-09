@@ -78,48 +78,29 @@ def parse_rcpa_issue_date(text: str) -> Optional[date]:
 
 def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
     """
-    Parse the 'Summary of Performance' / Performance Assessment table.
-    Handles two samples per survey (left and right tables).
+    Token-based parser for RCPA 'Summary of Performance' table.
+    Works when pdfminer breaks the row into multiple lines / columns.
+    Expects 2 samples per analyte (left + right).
     """
+
     program = parse_rcpa_program(text) or "RCPA Automated Differential"
     participant_id = parse_rcpa_participant_id(text)
     survey_no = parse_rcpa_survey_no(text)
     report_date = parse_rcpa_report_issue_date(text) or parse_rcpa_issue_date(text)
 
-    # flatten lines but keep order
-    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
-
-    # find the section start
-    start_idx = None
-    for i, l in enumerate(lines):
-        if re.search(r"Summary of Performance", l, re.IGNORECASE):
-            start_idx = i
-            break
-    if start_idx is None:
-        return []
-
-    # Detect the two sample IDs shown on that page
-    # e.g. "Sample: HA-AD1-25-05" and "Sample: HA-AD1-25-06"
+    # -------- find the two sample IDs anywhere in the report ----------
     sample_ids = []
-    for l in lines[start_idx:start_idx + 200]:
-        m = re.search(r"Sample:\s*(HA-[A-Z0-9]+-\d{2}-\d{2})", l, re.IGNORECASE)
-        if m:
-            sample_ids.append(m.group(1))
-        if len(sample_ids) >= 2:
-            break
-    # de-dupe preserving order
+    for m in re.finditer(r"Sample:\s*(HA-[A-Z0-9]+-\d{2}-\d{2})", text, flags=re.IGNORECASE):
+        sample_ids.append(m.group(1).strip())
+
+    # de-dupe preserve order
     seen = set()
     sample_ids = [s for s in sample_ids if not (s in seen or seen.add(s))]
 
     if len(sample_ids) < 2:
-        # still try: sometimes sample headings are on one line only
-        # fallback: find any HA-...-..-.. tokens near the section
-        for l in lines[start_idx:start_idx + 200]:
-            m2 = re.search(r"(HA-[A-Z0-9]+-\d{2}-\d{2})", l)
-            if m2:
-                sample_ids.append(m2.group(1))
-            if len(sample_ids) >= 2:
-                break
+        # fallback: any HA-... token
+        for m in re.finditer(r"(HA-[A-Z0-9]+-\d{2}-\d{2})", text, flags=re.IGNORECASE):
+            sample_ids.append(m.group(1).strip())
         seen = set()
         sample_ids = [s for s in sample_ids if not (s in seen or seen.add(s))]
 
@@ -128,69 +109,148 @@ def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
 
     left_sample, right_sample = sample_ids[0], sample_ids[1]
 
-    # Row pattern for the analyte table row:
-    # Test  Your Expected Review Z-Score APS  Your Expected Review Z-Score APS
-    row_pat = re.compile(
-        r"^(?P<analyte>[A-Za-z \-]+?)\s+"
-        r"(?P<y1>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<e1>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<r1>Within APS|High|Low|Acceptable)\s+"
-        r"(?P<z1>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<a1>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<y2>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<e2>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<r2>Within APS|High|Low|Acceptable)\s+"
-        r"(?P<z2>-?\d+(?:\.\d+)?)\s+"
-        r"(?P<a2>-?\d+(?:\.\d+)?)$"
-    )
+    # -------- locate the summary section (best-effort) ----------
+    low = text.lower()
+    start = low.find("summary of performance")
+    if start == -1:
+        # some PDFs use slightly different heading
+        m = re.search(r"summary\s+of\s+performance", text, flags=re.IGNORECASE)
+        if not m:
+            return []
+        start = m.start()
+
+    # take a window after the section start (big enough to contain the table)
+    window = text[start:start + 12000]
+
+    # normalize lines: keep order, drop empties
+    lines = [ln.strip() for ln in window.splitlines() if ln.strip()]
+
+    # We’ll parse per analyte by scanning tokens after the analyte heading.
+    # This is robust against column wrapping.
+    analytes = [
+        "White cell count",
+        "Neutrophils",
+        "Lymphocytes",
+        "Monocytes",
+        "Eosinophils",
+        "Basophils",
+        "Immature Granulocytes",
+    ]
+
+    def is_number(tok: str) -> bool:
+        return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", tok))
+
+    def is_review(tok: str) -> bool:
+        t = tok.strip().lower()
+        return t in {"high", "low", "acceptable"} or t == "within"  # "Within APS" comes as two tokens sometimes
+
+    def consume_after_analyte(i_analyte_line: int) -> Optional[tuple]:
+        """
+        After we hit the analyte line, collect tokens until we have:
+        y1, e1, review1, z1, aps1, y2, e2, review2, z2, aps2
+        Review can appear as "Within APS" (2 tokens) or "Within" on one line and "APS" on next.
+        """
+        toks: List[str] = []
+        for ln in lines[i_analyte_line + 1: i_analyte_line + 60]:
+            # stop if we hit next analyte heading early
+            if any(ln.lower() == a.lower() for a in analytes):
+                break
+
+            # split into tokens
+            parts = ln.split()
+            for p in parts:
+                toks.append(p)
+
+            # try parse once we have enough tokens
+            # BUT we must join "Within APS" into one logical review token
+            def normalize_reviews(raw: List[str]) -> List[str]:
+                out = []
+                j = 0
+                while j < len(raw):
+                    if raw[j].lower() == "within":
+                        # join within + aps if present
+                        if j + 1 < len(raw) and raw[j + 1].lower() == "aps":
+                            out.append("Within APS")
+                            j += 2
+                            continue
+                        out.append("Within")
+                        j += 1
+                        continue
+                    out.append(raw[j])
+                    j += 1
+                return out
+
+            ntoks = normalize_reviews(toks)
+
+            # Now attempt to pick fields in order:
+            picked = []
+            k = 0
+            while k < len(ntoks) and len(picked) < 10:
+                tok = ntoks[k]
+
+                if len(picked) in (0, 1, 3, 4, 5, 6, 8, 9):
+                    # numeric slots
+                    if is_number(tok):
+                        picked.append(tok)
+                elif len(picked) in (2, 7):
+                    # review slots
+                    if tok.lower() in {"high", "low", "acceptable"}:
+                        picked.append(tok.title())
+                    elif tok.lower() == "within aps":
+                        picked.append("Within APS")
+                k += 1
+
+            if len(picked) == 10:
+                # map into fields
+                y1, e1, r1, z1, a1, y2, e2, r2, z2, a2 = picked
+                return (
+                    float(y1), float(e1), r1, float(z1), float(a1),
+                    float(y2), float(e2), r2, float(z2), float(a2),
+                )
+
+        return None
 
     out: List[RCPARow] = []
 
-    for l in lines[start_idx:]:
-        # skip obvious header rows
-        if re.search(r"Test\s+Your Result\s+Expected Result", l, re.IGNORECASE):
-            continue
+    for i, ln in enumerate(lines):
+        for analyte in analytes:
+            if ln.strip().lower() == analyte.lower():
+                parsed = consume_after_analyte(i)
+                if not parsed:
+                    continue
 
-        m = row_pat.match(l.strip())
-        if not m:
-            # stop when leaving the assessment block
-            if re.search(r"Overall Performance|Cumulative Distribution Plot|Quantitative Statistics", l, re.IGNORECASE):
-                break
-            continue
+                y1, e1, r1, z1, a1, y2, e2, r2, z2, a2 = parsed
 
-        analyte = m.group("analyte").strip()
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=left_sample,
+                    analyte=analyte,
+                    your_result=y1,
+                    expected_result=e1,
+                    review=r1,
+                    z_score=z1,
+                    aps_score=a1,
+                ))
 
-        # left sample row
-        out.append(RCPARow(
-            program=program,
-            participant_id=participant_id,
-            survey_no=survey_no,
-            report_date=report_date,
-            sample_id=left_sample,
-            analyte=analyte,
-            your_result=float(m.group("y1")),
-            expected_result=float(m.group("e1")),
-            review=m.group("r1").strip(),
-            z_score=float(m.group("z1")),
-            aps_score=float(m.group("a1")),
-        ))
-
-        # right sample row
-        out.append(RCPARow(
-            program=program,
-            participant_id=participant_id,
-            survey_no=survey_no,
-            report_date=report_date,
-            sample_id=right_sample,
-            analyte=analyte,
-            your_result=float(m.group("y2")),
-            expected_result=float(m.group("e2")),
-            review=m.group("r2").strip(),
-            z_score=float(m.group("z2")),
-            aps_score=float(m.group("a2")),
-        ))
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=right_sample,
+                    analyte=analyte,
+                    your_result=y2,
+                    expected_result=e2,
+                    review=r2,
+                    z_score=z2,
+                    aps_score=a2,
+                ))
 
     return out
+
 
 ############################################
 # 1. PDF PARSING
@@ -278,11 +338,6 @@ def parse_metadata(full_text: str) -> dict:
         "instrument_name": instrument_name,
     }
 
-def get_pdf_report_date(pdf_path: Path):
-    from main import read_pdf_text, parse_metadata
-    txt = read_pdf_text(pdf_path)
-    meta = parse_metadata(txt)
-    return meta.get("report_date") or date.min
 
 def extract_tdpa(full_text: str, idx: int) -> Optional[float]:
     """
@@ -430,33 +485,38 @@ def flag_trend(last3_sdi: pd.Series) -> bool:
 
 def base_risk_for_row(row: pd.Series) -> str:
     abs_sdi = abs(row["SDI"]) if pd.notnull(row.get("SDI")) else None
-    ts = row.get("Target Score", None)
+
+    ts_raw = row.get("Target Score", None)
+    ts_num = pd.to_numeric(ts_raw, errors="coerce")
+    ts = None if pd.isna(ts_num) else float(ts_num)
+
     abs_dev = abs(row["%DEV"]) if pd.notnull(row.get("%DEV")) else None
-    tea_limit = row.get("TDPA_limit_percent", None)
+
+    tea_raw = row.get("TDPA_limit_percent", None)
+    tea_num = pd.to_numeric(tea_raw, errors="coerce")
+    tea_limit = None if pd.isna(tea_num) else float(tea_num)
 
     high_hits = []
 
     if abs_sdi is not None and abs_sdi >= 2:
         high_hits.append("SDI≥2")
 
-    # only evaluate TS rules if TS is present
-    if ts is not None and pd.notnull(ts):
+    if ts is not None:
         if ts < 40:
             high_hits.append("TS<40")
 
-    # only evaluate TDPA if present
-    if tea_limit is not None and pd.notnull(tea_limit) and abs_dev is not None:
-        if abs_dev > float(tea_limit):
+    if tea_limit is not None and abs_dev is not None:
+        if abs_dev > tea_limit:
             high_hits.append(">%TEa")
 
     if high_hits:
         return "High"
 
-    # Moderate: borderline but not failing
-    if (abs_sdi is not None and 1 <= abs_sdi < 2) or (ts is not None and pd.notnull(ts) and 41 <= ts <= 50):
+    if (abs_sdi is not None and 1 <= abs_sdi < 2) or (ts is not None and 41 <= ts <= 50):
         return "Moderate"
 
     return "Low"
+
 
 def base_risk_for_rcpa(z_score: float, aps_score: float,
                        within_internal_tea: Optional[bool],
@@ -578,18 +638,9 @@ def norm_analyte(s: str) -> str:
 
     # collapse whitespace
     s = re.sub(r"\s+", " ", s).strip().lower()
-
-    return s
-def norm_analyte(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    # unify degree symbol variants
-    s = s.replace("°c", "°c")
-    # special-case urate unit mismatch
     s = s.replace("uric acid (urate), mg/dl", "uric acid (urate), mmol/l")
     return s
+
 
 def load_internal_tea_map(path: Path) -> Dict[str, Optional[float]]:
     """
