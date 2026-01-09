@@ -64,7 +64,7 @@ def parse_rcpa_report_issue_date(text: str) -> Optional[date]:
             return None
 
 def parse_rcpa_issue_date(text: str) -> Optional[date]:
-    # Backwards-compatible alias
+    # Backwards-compatible alias used by older parts of the code
     return parse_rcpa_report_issue_date(text)
 
 
