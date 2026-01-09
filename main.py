@@ -781,7 +781,7 @@ def ensure_cycle_history_sheet(wb: Workbook):
         for col_i, header in enumerate(headers, start=1):
             ws.cell(row=1, column=col_i).value = header
 
-def ensure_cycle_history_columns(wb: Workbook):
+def ensure_cycle_history_columns(wb: Workbook, include_rcpa_cols: bool = False):
     """
     If Cycle_History already exists but is missing the new columns,
     insert them at the correct positions.
@@ -796,27 +796,29 @@ def ensure_cycle_history_columns(wb: Workbook):
     def find_col(name: str):
         return headers.index(name) + 1 if name in headers else None
 
-    # --- Insert APS after TEa_or_TDPA(%) ---
-    if "APS" not in headers:
-        tea_col = find_col("TEa_or_TDPA(%)")
-        if tea_col is None:
-            raise ValueError("Cycle_History missing 'TEa_or_TDPA(%)'")
-        ws.insert_cols(tea_col + 1)
-        ws.cell(row=1, column=tea_col + 1).value = "APS"
+    # --- Insert APS + Review ONLY for RCPA ---
+    if include_rcpa_cols:
+        # --- Insert APS after TEa_or_TDPA(%) ---
+        if "APS" not in headers:
+            tea_col = find_col("TEa_or_TDPA(%)")
+            if tea_col is None:
+                raise ValueError("Cycle_History missing 'TEa_or_TDPA(%)'")
+            ws.insert_cols(tea_col + 1)
+            ws.cell(row=1, column=tea_col + 1).value = "APS"
 
-        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-        headers = [str(h).strip() if h is not None else "" for h in headers]
+            headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+            headers = [str(h).strip() if h is not None else "" for h in headers]
 
-    # --- Insert Review after APS ---
-    if "Review" not in headers:
-        aps_col = find_col("APS")
-        if aps_col is None:
-            raise ValueError("Cycle_History missing 'APS' (cannot insert Review)")
-        ws.insert_cols(aps_col + 1)
-        ws.cell(row=1, column=aps_col + 1).value = "Review"
+        # --- Insert Review after APS ---
+        if "Review" not in headers:
+            aps_col = find_col("APS")
+            if aps_col is None:
+                raise ValueError("Cycle_History missing 'APS' (cannot insert Review)")
+            ws.insert_cols(aps_col + 1)
+            ws.cell(row=1, column=aps_col + 1).value = "Review"
 
-        headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
-        headers = [str(h).strip() if h is not None else "" for h in headers]
+            headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+            headers = [str(h).strip() if h is not None else "" for h in headers]
 
     # --- Insert Internal_TEa after Review ---
     if "Internal_TEa" not in headers:
@@ -981,9 +983,20 @@ def backfill_internal_tea_in_cycle_history(wb: Workbook, internal_tea_map: dict)
 
 
 def append_df_to_worksheet(ws, df: pd.DataFrame):
-    """Append rows of df to ws (no header)."""
-    for _, row in df.iterrows():
-        ws.append(list(row))
+    """
+    Append df rows into ws by matching the worksheet header names.
+    Prevents column-shift bugs when columns are inserted/reordered.
+    """
+    # sheet headers (row 1)
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column + 1)]
+    headers = [str(h).strip() if h is not None else "" for h in headers]
+
+    for _, r in df.iterrows():
+        out_row = []
+        for h in headers:
+            out_row.append(r.get(h, None))
+        ws.append(out_row)
+
 
 
 def fill_header_information_sheet(wb: Workbook, meta: dict):
@@ -1257,7 +1270,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
 
         # Ensure Cycle_History exists and is valid
         ensure_cycle_history_sheet(wb)
-        ensure_cycle_history_columns(wb)
+        ensure_cycle_history_columns(wb, include_rcpa_cols=True)
         backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
 
         # Convert existing history to DataFrame (for risk calc if needed)
@@ -1580,7 +1593,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         wb = Workbook()
 
     ensure_cycle_history_sheet(wb)
-    ensure_cycle_history_columns(wb)
+    ensure_cycle_history_columns(wb, include_rcpa_cols=False)
     # ✅ backfill old rows that existed before these columns were added
     backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
 
