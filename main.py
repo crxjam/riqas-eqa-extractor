@@ -34,6 +34,25 @@ def is_rcpa_report(text: str) -> bool:
     t = text.lower()
     return ("rcpa" in t) or ("rcpaqap" in t) or ("issue date:" in t and "participant id:" in t)
 
+def coerce_cycle_history_types(hist_df: pd.DataFrame) -> pd.DataFrame:
+    if hist_df is None or hist_df.empty:
+        return hist_df
+
+    # dates
+    if "Report_Date" in hist_df.columns:
+        hist_df["Report_Date"] = pd.to_datetime(hist_df["Report_Date"], errors="coerce")
+
+    # numerics used in comparisons / thresholds
+    numeric_cols = [
+        "diff_from_mean", "SDI", "%DEV", "Target_Score",
+        "TEa_or_TDPA(%)", "Internal_TEa", "Peer_Mean", "Your_Result"
+    ]
+    for col in numeric_cols:
+        if col in hist_df.columns:
+            hist_df[col] = pd.to_numeric(hist_df[col], errors="coerce")
+
+    return hist_df
+
 
 
 def parse_rcpa_participant_id(text: str) -> Optional[str]:
@@ -1228,22 +1247,58 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
     full_text = normalize_pdf_text(full_text)
 
     # ==========================================================
-    # RCPA branch (Option B): write Cycle_History only
+    # RCPA branch (Option B): ONLY update Cycle_History and EXIT
     # ==========================================================
     if is_rcpa_report(full_text):
         internal_tea_map = internal_tea_map or {}
 
-        # Open workbook / init history
+        # Load or create workbook
         wb = load_workbook(xlsx_path) if xlsx_path.exists() else Workbook()
+
+        # Ensure Cycle_History exists and is valid
         ensure_cycle_history_sheet(wb)
         ensure_cycle_history_columns(wb)
         backfill_internal_tea_in_cycle_history(wb, internal_tea_map)
 
+        # Convert existing history to DataFrame (for risk calc if needed)
         hist_ws = wb["Cycle_History"]
-        hist_df_existing = ws_to_dataframe(hist_ws) if hist_ws.max_row > 1 else pd.DataFrame()
+        hist_df_existing = (
+            ws_to_dataframe(hist_ws)
+            if hist_ws.max_row > 1
+            else pd.DataFrame(columns=[
+                "Cycle_No",
+                "Sample_No",
+                "Report_Date",
+                "Analyte",
+                "Peer_Mean",
+                "Your_Result",
+                "%DEV",
+                "SDI",
+                "Target_Score",
+                "TEa_or_TDPA(%)",
+                "Internal_TEa",
+                "diff_from_mean",
+                "Risk_Category_BaseOnly",
+                "Risk_Category_Final",
+                "Bias_Flag_Last3",
+                "Trend_Flag_Last3",
+                "Within_Internal_TEa?",
+                "Required_Action",
+                "Comment",
+            ])
+        )
 
-        if not hist_df_existing.empty and "Report_Date" in hist_df_existing.columns:
-            hist_df_existing["Report_Date"] = pd.to_datetime(hist_df_existing["Report_Date"], errors="coerce")
+        if "Report_Date" in hist_df_existing.columns:
+            hist_df_existing["Report_Date"] = pd.to_datetime(
+                hist_df_existing["Report_Date"], errors="coerce"
+            )
+        hist_df_existing = coerce_cycle_history_types(hist_df_existing)
+
+        # >>> IMPORTANT <<<
+        # RCPA reports do NOT update Header Information,
+        # Result Summary, or Latest_Cycle
+        wb.save(out_path)
+        return
 
         # ----------------------------------------------------------
         # RCPA metadata (so Report_Date is ALWAYS populated)
@@ -1558,6 +1613,7 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
         "Required_Action",
         "Comment",
     ])
+    hist_df_existing = coerce_cycle_history_types(hist_df_existing)
 
     if not hist_df_existing.empty:
         hist_df_existing["Report_Date"] = pd.to_datetime(
