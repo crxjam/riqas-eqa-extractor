@@ -4,3 +4,8 @@ venv/
 .idea/
 .DS_Store
 node_modules/
+
+# build artefacts
+/dist/
+/vite/
+/rqxheqa-web@0.0.0
