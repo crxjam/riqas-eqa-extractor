@@ -2,6 +2,9 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
+from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI
+
 
 from pathlib import Path
 import shutil
@@ -20,9 +23,16 @@ from main import (
 
 app = FastAPI()
 
-@app.get("/")
-def root():
-    return {"status": "ok", "docs": "/docs"}
+DIST_DIR = Path(__file__).resolve().parent / "dist"
+
+if DIST_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="frontend")
+
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return {"status": "ok"}
+
 
 app.add_middleware(
     CORSMiddleware,
