@@ -13,3 +13,7 @@ node_modules/
 # extra build tooling artefacts
 vite
 vite/
+
+# node/vite
+node_modules/
+node_modules/.vite/
