@@ -9,3 +9,7 @@ node_modules/
 /dist/
 /vite/
 /rqxheqa-web@0.0.0
+
+# extra build tooling artefacts
+vite
+vite/
