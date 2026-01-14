@@ -3,8 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
-from fastapi import FastAPI
-
 
 from pathlib import Path
 import shutil
@@ -23,41 +21,20 @@ from main import (
 
 app = FastAPI()
 
-DIST_DIR = Path(__file__).resolve().parent / "dist"
-
-if DIST_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="frontend")
-
+# -----------------------
+# API routes FIRST
+# -----------------------
 
 @app.get("/health", include_in_schema=False)
 def health():
     return {"status": "ok"}
 
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "https://crxjam.github.io",
-    ],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
-)
-
-
-
-
-
-def cleanup_dir(tmpdir: str):
-    """Delete temp working directory after response is sent."""
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:
-        pass
-
+@app.get("/__routes", include_in_schema=False)
+def __routes():
+    return sorted([
+        f"{r.path}::{','.join(sorted(getattr(r, 'methods', []) or []))}"
+        for r in app.router.routes
+    ])
 
 @app.post("/process")
 async def process(
@@ -65,40 +42,32 @@ async def process(
     template: UploadFile = File(...),
     tea: UploadFile = File(...),
 ):
-    """
-    Accept:
-      - multiple PDFs (pdfs)
-      - one Excel template (template)
-      - one Internal TEa xlsx/csv (tea)
-    Return:
-      - one rolling workbook (RIQAS_EQA_Rolling_History.xlsx)
-    """
-
     tmpdir = tempfile.mkdtemp(prefix="rqxheqa_")
     tmp = Path(tmpdir)
     pdf_dir = tmp / "pdfs"
     pdf_dir.mkdir(parents=True, exist_ok=True)
 
+    def cleanup_dir(d: str):
+        try:
+            shutil.rmtree(d, ignore_errors=True)
+        except Exception:
+            pass
+
     try:
-        # save template
         template_path = tmp / (template.filename or "template.xlsx")
         template_path.write_bytes(await template.read())
 
-        # save tea file
         tea_path = tmp / (tea.filename or "tea.xlsx")
         tea_path.write_bytes(await tea.read())
 
-        # save PDFs
         pdf_paths: List[Path] = []
         for up in pdfs:
             p = pdf_dir / (up.filename or "input.pdf")
             p.write_bytes(await up.read())
             pdf_paths.append(p)
 
-        # load TEa map
         tea_map = load_internal_tea_map(tea_path)
 
-        # sort PDFs by report date
         def get_pdf_report_date(p: Path):
             txt = read_pdf_text(p)
             meta = parse_metadata(txt)
@@ -106,11 +75,9 @@ async def process(
 
         pdf_paths_sorted = sorted(pdf_paths, key=get_pdf_report_date)
 
-        # create rolling workbook from template
         rolling_out = tmp / "RIQAS_EQA_Rolling_History.xlsx"
         shutil.copyfile(template_path, rolling_out)
 
-        # process each PDF into the rolling workbook
         errors = []
         ok = 0
 
@@ -133,14 +100,6 @@ async def process(
                 status_code=400,
             )
 
-        if not rolling_out.exists():
-            cleanup_dir(tmpdir)
-            return JSONResponse(
-                {"error": "Output workbook was not created", "expected_path": str(rolling_out)},
-                status_code=500,
-            )
-
-        # --- STREAM THE XLSX BYTES (forces correct download handling) ---
         data = rolling_out.read_bytes()
         buf = BytesIO(data)
         buf.seek(0)
@@ -160,3 +119,28 @@ async def process(
     except Exception as e:
         cleanup_dir(tmpdir)
         return JSONResponse({"error": repr(e)}, status_code=500)
+
+# -----------------------
+# CORS
+# -----------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "https://crxjam.github.io",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+)
+
+# -----------------------
+# Frontend LAST (so it can't steal /process)
+# -----------------------
+DIST_DIR = Path(__file__).resolve().parent / "dist"
+if DIST_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(DIST_DIR), html=True), name="frontend")
