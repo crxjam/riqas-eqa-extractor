@@ -146,129 +146,6 @@ def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
 
     # We’ll parse per analyte by scanning tokens after the analyte heading.
     # This is robust against column wrapping.
-    analytes = [
-        "White cell count",
-        "Neutrophils",
-        "Lymphocytes",
-        "Monocytes",
-        "Eosinophils",
-        "Basophils",
-        "Immature Granulocytes",
-    ]
-
-    def is_number(tok: str) -> bool:
-        return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", tok))
-
-    def is_review(tok: str) -> bool:
-        t = tok.strip().lower()
-        return t in {"high", "low", "acceptable"} or t == "within"  # "Within APS" comes as two tokens sometimes
-
-    def consume_after_analyte(i_analyte_line: int) -> Optional[tuple]:
-        """
-        After we hit the analyte line, collect tokens until we have:
-        y1, e1, review1, z1, aps1, y2, e2, review2, z2, aps2
-        Review can appear as "Within APS" (2 tokens) or "Within" on one line and "APS" on next.
-        """
-        toks: List[str] = []
-        for ln in lines[i_analyte_line + 1: i_analyte_line + 60]:
-            # stop if we hit next analyte heading early
-            if any(ln.lower() == a.lower() for a in analytes):
-                break
-
-            # split into tokens
-            parts = ln.split()
-            for p in parts:
-                toks.append(p)
-
-            # try parse once we have enough tokens
-            # BUT we must join "Within APS" into one logical review token
-            def normalize_reviews(raw: List[str]) -> List[str]:
-                out = []
-                j = 0
-                while j < len(raw):
-                    if raw[j].lower() == "within":
-                        # join within + aps if present
-                        if j + 1 < len(raw) and raw[j + 1].lower() == "aps":
-                            out.append("Within APS")
-                            j += 2
-                            continue
-                        out.append("Within")
-                        j += 1
-                        continue
-                    out.append(raw[j])
-                    j += 1
-                return out
-
-            ntoks = normalize_reviews(toks)
-
-            # Now attempt to pick fields in order:
-            picked = []
-            k = 0
-            while k < len(ntoks) and len(picked) < 10:
-                tok = ntoks[k]
-
-                if len(picked) in (0, 1, 3, 4, 5, 6, 8, 9):
-                    # numeric slots
-                    if is_number(tok):
-                        picked.append(tok)
-                elif len(picked) in (2, 7):
-                    # review slots
-                    if tok.lower() in {"high", "low", "acceptable"}:
-                        picked.append(tok.title())
-                    elif tok.lower() == "within aps":
-                        picked.append("Within APS")
-                k += 1
-
-            if len(picked) == 10:
-                # map into fields
-                y1, e1, r1, z1, a1, y2, e2, r2, z2, a2 = picked
-                return (
-                    float(y1), float(e1), r1, float(z1), float(a1),
-                    float(y2), float(e2), r2, float(z2), float(a2),
-                )
-
-        return None
-
-    out: List[RCPARow] = []
-
-    for i, ln in enumerate(lines):
-        for analyte in analytes:
-            if ln.strip().lower() == analyte.lower():
-                parsed = consume_after_analyte(i)
-                if not parsed:
-                    continue
-
-                y1, e1, r1, z1, a1, y2, e2, r2, z2, a2 = parsed
-
-                out.append(RCPARow(
-                    program=program,
-                    participant_id=participant_id,
-                    survey_no=survey_no,
-                    report_date=report_date,
-                    sample_id=left_sample,
-                    analyte=analyte,
-                    your_result=y1,
-                    expected_result=e1,
-                    review=r1,
-                    z_score=z1,
-                    aps_score=a1,
-                ))
-
-                out.append(RCPARow(
-                    program=program,
-                    participant_id=participant_id,
-                    survey_no=survey_no,
-                    report_date=report_date,
-                    sample_id=right_sample,
-                    analyte=analyte,
-                    your_result=y2,
-                    expected_result=e2,
-                    review=r2,
-                    z_score=z2,
-                    aps_score=a2,
-                ))
-
-    return out
 
 
 ############################################
@@ -1356,6 +1233,25 @@ def process_riqas_pdf_into_workbook(pdf_path: str, xlsx_path: str, out_path: Opt
                 df_rcpa["Sample_ID"] = "UNKNOWN"
                 df_rcpa["RCPA_APS"] = df_rcpa.get("RCPA_APS", None)
                 df_rcpa["RCPA_Review"] = df_rcpa.get("RCPA_Review", "")
+
+            # --- RCPA: normalise column names (prevents KeyError on different report types) ---
+            # Some RCPA parsers produce snake_case, some produce human names.
+            rename_map = {
+                "your_result": "Your Result",
+                "expected_result": "Peer Mean",
+                "peer_mean": "Peer Mean",
+                "mean": "Peer Mean",
+                "expected": "Peer Mean",
+            }
+            df_rcpa = df_rcpa.rename(columns=rename_map)
+
+            required_cols = {"Your Result", "Peer Mean"}
+            missing = required_cols - set(df_rcpa.columns)
+            if missing:
+                raise ValueError(
+                    f"RCPA parse produced no usable numeric table for this program. "
+                    f"Missing columns: {sorted(missing)}. Found: {list(df_rcpa.columns)}"
+                )
 
         # Ensure diff_from_mean exists (block parser doesn't always set it)
         if "diff_from_mean" not in df_rcpa.columns:
