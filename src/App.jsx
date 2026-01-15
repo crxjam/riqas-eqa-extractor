@@ -74,7 +74,7 @@ export default function App() {
         </div>
 
         <p style={{ opacity: 0.85 }}>
-          Upload RIQAS EQA PDF reports, your Excel template, and your Internal TEa
+          Upload EQA PDF reports, your Excel template, and your Internal TEa
           (Total Allowable Error) table. A single rolling workbook will be returned.
         </p>
 
@@ -84,7 +84,7 @@ export default function App() {
             onChange={(e) => setPdfs(Array.from(e.target.files || []))}
           />
           <p style={{ fontSize: 13, opacity: 0.7 }}>
-            One or more RIQAS EQA PDFs. Multiple PDFs are processed in date order.
+            Drag and drop one or more EQA PDFs. Multiple PDFs are processed in date order.
           </p>
 
           <label><b>2) Excel template (.xlsx)</b></label><br />
