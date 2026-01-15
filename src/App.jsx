@@ -1,111 +1,126 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
+
+const API_BASE = "https://riqas-eqa-extractor.onrender.com";
 
 export default function App() {
   const [pdfs, setPdfs] = useState([]);
   const [template, setTemplate] = useState(null);
   const [tea, setTea] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState(false);
 
-  async function handleProcess() {
-    if (!pdfs.length || !template || !tea) {
-      alert("Please select PDFs, template, and TEA file.");
-      return;
-    }
+  const canSubmit = useMemo(
+    () => pdfs.length > 0 && template && tea && !busy,
+    [pdfs, template, tea, busy]
+  );
 
-    const form = new FormData();
-    pdfs.forEach((p) => form.append("pdfs", p));
-    form.append("template", template);
-    form.append("tea", tea);
-
-    setLoading(true);
+  async function upload(e) {
+    e.preventDefault();
 
     try {
-      const API = "https://riqas-eqa-extractor.onrender.com";
+      setBusy(true);
+      setStatus("Uploading and processing…");
 
-      const res = await fetch(`${API}/process`, {
+      const fd = new FormData();
+      pdfs.forEach((f) => fd.append("pdfs", f));
+      fd.append("template", template);
+      fd.append("tea", tea);
+
+      const res = await fetch(`${API_BASE}/process`, {
         method: "POST",
-        body: form,
+        body: fd,
       });
 
       if (!res.ok) {
-        const txt = await res.text();
-        alert("Server error:\n" + txt);
-        return;
+        throw new Error(await res.text());
       }
 
-      // Download Excel (read body ONCE)
       const blob = await res.blob();
-
-      // filename from header (needs CORS expose on backend)
-      const cd = res.headers.get("content-disposition") || "";
-      const match = cd.match(/filename\*?=(?:UTF-8''|")?([^";\n]+)"?/i);
-
-      let filename = match
-        ? decodeURIComponent(match[1])
-        : "RIQAS_EQA_Rolling_History.xlsx";
-
-      if (!filename.toLowerCase().endsWith(".xlsx")) filename += ".xlsx";
-
       const url = window.URL.createObjectURL(blob);
+
       const a = document.createElement("a");
       a.href = url;
-      a.download = filename;
+      a.download = "EQA_Rolling_History.xlsx";
       document.body.appendChild(a);
       a.click();
       a.remove();
+
       window.URL.revokeObjectURL(url);
+      setStatus("Done. Workbook downloaded.");
     } catch (err) {
-      console.error(err);
-      alert("Failed:\n" + (err?.message || String(err)));
+      setStatus(String(err));
     } finally {
-      setLoading(false);
+      setBusy(false);
     }
   }
 
   return (
-    <div style={{ padding: "2rem", fontFamily: "Arial" }}>
-      <h1>RIQAS EQA Extractor</h1>
+    <div style={{ padding: 20, fontFamily: "system-ui, sans-serif" }}>
+      <div
+        style={{
+          maxWidth: 820,
+          margin: "40px auto",
+          padding: 24,
+          borderRadius: 14,
+          border: "1px solid rgba(0,0,0,0.1)",
+          boxShadow: "0 10px 25px rgba(0,0,0,0.08)",
+        }}
+      >
+        <div style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+          <h1 style={{ margin: 0 }}>EQA Extractor</h1>
+          <span style={{ fontStyle: "italic", opacity: 0.65 }}>
+            Developed by James Croxford
+          </span>
+        </div>
 
-      <label>
-        PDFs (multiple):
-        <input
-          type="file"
-          multiple
-          accept=".pdf"
-          onChange={(e) => setPdfs([...e.target.files])}
-        />
-      </label>
+        <p style={{ opacity: 0.85 }}>
+          Upload RIQAS EQA PDF reports, your Excel template, and your Internal TEa
+          (Total Allowable Error) table. A single rolling workbook will be returned.
+        </p>
 
-      <br />
-      <br />
+        <form onSubmit={upload}>
+          <label><b>1) EQA PDF reports</b></label><br />
+          <input type="file" accept="application/pdf" multiple
+            onChange={(e) => setPdfs(Array.from(e.target.files || []))}
+          />
+          <p style={{ fontSize: 13, opacity: 0.7 }}>
+            One or more RIQAS EQA PDFs. Multiple PDFs are processed in date order.
+          </p>
 
-      <label>
-        Template (.xlsx):
-        <input
-          type="file"
-          accept=".xlsx"
-          onChange={(e) => setTemplate(e.target.files[0])}
-        />
-      </label>
+          <label><b>2) Excel template (.xlsx)</b></label><br />
+          <input type="file" accept=".xlsx"
+            onChange={(e) => setTemplate(e.target.files[0])}
+          />
+          <p style={{ fontSize: 13, opacity: 0.7 }}>
+            The EQA template containing sheets such as Header Information,
+            Result Summary, and Cycle_History.
+          </p>
 
-      <br />
-      <br />
+          <label><b>3) Internal TEa / TAE table (.xlsx or .csv)</b></label><br />
+          <input type="file" accept=".xlsx,.csv"
+            onChange={(e) => setTea(e.target.files[0])}
+          />
+          <p style={{ fontSize: 13, opacity: 0.7 }}>
+            Must include columns for analyte name and Internal TEa values.
+          </p>
 
-      <label>
-        TEA file:
-        <input
-          type="file"
-          accept=".xlsx,.csv"
-          onChange={(e) => setTea(e.target.files[0])}
-        />
-      </label>
+          <button
+            type="submit"
+            disabled={!canSubmit}
+            style={{
+              marginTop: 16,
+              padding: "10px 14px",
+              fontWeight: 700,
+              opacity: canSubmit ? 1 : 0.5,
+            }}
+          >
+            {busy ? "Processing…" : "Process & Download"}
+          </button>
+        </form>
 
-      <br />
-      <br />
-
-      <button onClick={handleProcess} disabled={loading}>
-        {loading ? "Processing..." : "Process"}
-      </button>
+        {status && <p style={{ marginTop: 12 }}>{status}</p>}
+      </div>
     </div>
   );
 }
+

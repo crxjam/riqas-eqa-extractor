@@ -105,7 +105,7 @@ async def process(
         buf.seek(0)
 
         headers = {
-            "Content-Disposition": 'attachment; filename="RIQAS_EQA_Rolling_History.xlsx"',
+            "Content-Disposition": 'attachment; filename="EQA_Rolling_History.xlsx"',
             "Cache-Control": "no-store",
         }
 
