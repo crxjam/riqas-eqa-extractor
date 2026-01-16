@@ -330,6 +330,110 @@ def find_analyte_labels(full_text: str) -> list[str]:
         if x not in seen:
             seen.add(x)
             out.append(x)
+    # ------------------------------------------------------------
+    # Fallback parser for RCPA "Summary of Performance" tables
+    # Works for Auto Diff AND COAG factors by reading each row line,
+    # grabbing the analyte name before the first number, and mapping
+    # the numeric columns for Sample 1 + Sample 2 (and optional MPS).
+    # ------------------------------------------------------------
+    if not out:
+        # Identify the table header line (best-effort), then parse rows until "Overall Performance"
+        start_idx = 0
+        for idx, ln in enumerate(lines):
+            l = ln.lower()
+            if ("test" in l and "your result" in l and "expected result" in l):
+                start_idx = idx + 1
+                break
+
+        for ln in lines[start_idx:]:
+            if "overall performance" in ln.lower():
+                break
+
+            # Extract all numeric tokens from the line (handles +/-, decimals)
+            nums = re.findall(r"[-+]?\d+(?:\.\d+)?", ln)
+            if len(nums) < 4:
+                # likely an interpretation row ("Normal", "Abnormal", "No Target Set") → skip
+                continue
+
+            # Get analyte/test name: everything before the first numeric occurrence
+            m_first = re.search(r"[-+]?\d+(?:\.\d+)?", ln)
+            if not m_first:
+                continue
+            analyte = ln[:m_first.start()].strip()
+            if not analyte:
+                continue
+
+            def f(i):
+                return float(nums[i]) if i < len(nums) else None
+
+            # Default mapping
+            # Many reports contain:
+            # Sample 1: Your, Expected, Z, APS  (4 numbers)
+            # Sample 2: Your, Expected, Z, APS  (4 numbers)
+            # Optional: MPS (1 number)
+            y1 = f(0)
+            e1 = f(1)
+
+            z1 = f(2) if len(nums) >= 3 else None
+            a1 = f(3) if len(nums) >= 4 else None
+
+            y2 = f(4) if len(nums) >= 5 else None
+            e2 = f(5) if len(nums) >= 6 else None
+
+            z2 = f(6) if len(nums) >= 7 else None
+            a2 = f(7) if len(nums) >= 8 else None
+
+            # Optional MPS at the end (COAG factors often has this)
+            mps = f(8) if len(nums) >= 9 else None
+
+            # If we only got 4 numbers, assume it's: y1, e1, y2, e2 (no z/aps)
+            if len(nums) == 4:
+                z1 = a1 = z2 = a2 = None
+                y2 = f(2)
+                e2 = f(3)
+
+            # Basic review extraction (optional, but nice)
+            review = None
+            low = ln.lower()
+            if "within aps" in low:
+                review = "Within APS"
+            elif "high" in low:
+                review = "High"
+            elif "low" in low:
+                review = "Low"
+            elif "not assessed" in low:
+                review = "Not Assessed"
+
+            # Only add rows if we have at least your+expected for each sample
+            if y1 is not None and e1 is not None:
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=left_sample,
+                    analyte=analyte,
+                    your_result=y1,
+                    expected_result=e1,
+                    review=review,
+                    z_score=z1,
+                    aps_score=a1,
+                ))
+
+            if y2 is not None and e2 is not None:
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=right_sample,
+                    analyte=analyte,
+                    your_result=y2,
+                    expected_result=e2,
+                    review=review,
+                    z_score=z2,
+                    aps_score=a2,
+                ))
     return out
 
 
