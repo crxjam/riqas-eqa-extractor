@@ -144,8 +144,102 @@ def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
         window = window[: end + 400]  # keep a small tail to include the end of table
 
     lines = [ln.strip() for ln in window.splitlines() if ln.strip()]
-
+    # ------------------------------------------------------------
+    # FAST PATH: Auto Diff / most programs have full rows on one line:
+    # "White cell count 17.66 17.88 Within APS -0.6 -0.1 2.83 2.81 Within APS 0.3 0.0"
+    # ------------------------------------------------------------
     out: List[RCPARow] = []
+
+    # locate the header row then parse until "Overall Performance"
+    header_idx = None
+    for idx, ln in enumerate(lines):
+        l = ln.lower()
+        if l.startswith("test ") and "your result" in l and "expected result" in l:
+            header_idx = idx + 1
+            break
+
+    if header_idx is not None:
+        for ln in lines[header_idx:]:
+            if "overall performance" in ln.lower():
+                break
+            if ln.lower().startswith("sample:"):
+                continue
+
+            # must have at least 6 numeric tokens (usually 8-10)
+            nums = re.findall(r"[-+]?\d+(?:\.\d+)?", ln)
+            if len(nums) < 6:
+                continue
+
+            # split by first number to get analyte name
+            m_first = re.search(r"[-+]?\d+(?:\.\d+)?", ln)
+            if not m_first:
+                continue
+            analyte = ln[:m_first.start()].strip()
+            if not analyte:
+                continue
+
+            # Extract review words by removing analyte + numbers and taking known phrases
+            low = ln.lower()
+            def pick_review(s: str) -> str:
+                if "within aps" in s:
+                    return "Within APS"
+                if "not assessed" in s:
+                    return "Not Assessed"
+                if "no submission" in s:
+                    return "No Submission"
+                if "high" in s:
+                    return "High"
+                if "low" in s:
+                    return "Low"
+                return ""
+
+            review1 = pick_review(low)
+            review2 = pick_review(low[low.find(nums[0]):])  # crude but ok
+
+            def f(i):
+                return float(nums[i]) if i < len(nums) else None
+
+            # Map numeric columns:
+            # y1 e1 z1 a1 y2 e2 z2 a2  (APS score may be present)
+            y1, e1 = f(0), f(1)
+            z1 = f(2) if len(nums) >= 3 else None
+            a1 = f(3) if len(nums) >= 4 else None
+            y2 = f(4) if len(nums) >= 5 else None
+            e2 = f(5) if len(nums) >= 6 else None
+            z2 = f(6) if len(nums) >= 7 else None
+            a2 = f(7) if len(nums) >= 8 else None
+
+            # Only append if we have the key pairs
+            if y1 is not None and e1 is not None:
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=left_sample,
+                    analyte=analyte,
+                    your_result=y1,
+                    expected_result=e1,
+                    review=review1 or None,
+                    z_score=z1,
+                    aps_score=a1,
+                ))
+
+            if y2 is not None and e2 is not None:
+                out.append(RCPARow(
+                    program=program,
+                    participant_id=participant_id,
+                    survey_no=survey_no,
+                    report_date=report_date,
+                    sample_id=right_sample,
+                    analyte=analyte,
+                    your_result=y2,
+                    expected_result=e2,
+                    review=review2 or None,
+                    z_score=z2,
+                    aps_score=a2,
+                ))
+
 
     # -----------------------------
     # Helper functions
@@ -241,7 +335,10 @@ def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
     # ------------------------------------------------------------
     # Parser B: vertical layout (each column on its own line)
     # ------------------------------------------------------------
+    is_coag = left_sample.startswith("HA-CF") or right_sample.startswith("HA-CF") or ("coagulation" in (program or "").lower())
+
     if not out:
+
         # start after "Test" header
         start_idx = 0
         for idx, ln in enumerate(lines):
@@ -254,33 +351,43 @@ def parse_rcpa_summary_of_performance(text: str) -> List[RCPARow]:
             if not t:
                 return False
 
-            bad = [
+            # hard-stop junk that appears after the table
+            bad_contains = [
+                "overall performance",
                 "report id",
                 "prepared by",
-                "date ",
+                "participant id",
+                "survey report",
                 "page ",
                 "result review",
                 "method categories",
-                "calibrator",
                 "measurement system",
                 "reagent",
+                "analytical principle",
                 "analytical performance specifications",
                 "target source",
                 "results assessed against",
-                "lab results",
                 "serial no",
-                "instrument",
-                "plasma",
+                "lab results",
+                "z-score",
+                "z score",
+                "aps",
             ]
-            if any(b in t for b in bad):
+            if any(b in t for b in bad_contains):
                 return False
 
-            # skip interpretation rows
-            if "interpretation" in t:
+            # headers/noise
+            if is_header_line(name):
+                return False
+            if t.startswith("sample:"):
                 return False
 
-            # COAG program rows start with "Factor ..."
-            if not t.startswith("factor "):
+            # reject lines that are basically just numbers/symbols
+            if re.fullmatch(r"[-\d.]+", t):
+                return False
+
+            # very short = noise
+            if len(t) < 3:
                 return False
 
             return True
